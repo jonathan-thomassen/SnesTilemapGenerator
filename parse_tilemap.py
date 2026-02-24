@@ -29,6 +29,7 @@ class PaletteInfo:
 
     data: bytes
     transparency: int | bytes | None = None
+    num_colors: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -184,29 +185,38 @@ def save_csv(array_2d: list[list[TileEntry]], stem_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None]:
+def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, int]:
     """Slice a tileset PNG into TILE_SIZE×TILE_SIZE images.
 
     If the source image is in Indexed Color Mode ("P"), the palette and any
     transparency index are preserved in a PaletteInfo so output images can be
     saved in the same mode with full transparency retained.  For all other
     modes the image is converted to RGBA.
-    Returns (tiles, palette) where palette is None for non-indexed images.
+    Returns (tiles, palette, color_count) where palette is None for non-indexed
+    images and color_count is the number of distinct colors used in the source PNG.
     """
     tileset = Image.open(png_path)
     if tileset.mode == "P":
         pal_data = bytes(tileset.getpalette() or [])
         pal_transparency = tileset.info.get("transparency")
-        palette: PaletteInfo | None = PaletteInfo(pal_data, pal_transparency)
+        color_count: int = len(set(tileset.getdata()))
+        palette: PaletteInfo | None = PaletteInfo(
+            pal_data,
+            pal_transparency,
+            color_count,
+        )
         trans_note = (
             f", transparency index {pal_transparency}"
             if pal_transparency is not None
             else ""
         )
-        print(f"Tileset mode: Indexed Color (P) — palette preserved{trans_note}")
+        print(
+            f"Tileset mode: Indexed Color (P) — palette preserved{trans_note}, {color_count} colors",
+        )
     else:
         tileset = tileset.convert("RGBA")
         palette = None
+        color_count = len(set(tileset.getdata()))
         print(f"Tileset mode: {tileset.mode}")
 
     ts_w, ts_h = tileset.size
@@ -230,7 +240,7 @@ def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None]:
         for tx in range(tiles_per_row):
             x0, y0 = tx * TILE_SIZE, ty * TILE_SIZE
             tiles.append(tileset.crop((x0, y0, x0 + TILE_SIZE, y0 + TILE_SIZE)))
-    return tiles, palette
+    return tiles, palette, color_count
 
 
 def deduplicate_tiles(
@@ -348,6 +358,133 @@ def remove_unused_tiles(
     return [tiles[i] for i in kept]
 
 
+# 16-color canonical sub-palette table for 4-color SNES tilesets.
+# Sub-palette P occupies indices P*4 … P*4+3.
+# Stored as 256-entry RGB flat bytes (768 bytes) as Pillow requires.
+_SNES_GRAYSCALE_16: bytes = bytes(
+    [
+        0x00,
+        0x00,
+        0x00,  # 0  - group 0
+        0x30,
+        0x30,
+        0x30,  # 1
+        0x40,
+        0x40,
+        0x40,  # 2
+        0x50,
+        0x50,
+        0x50,  # 3
+        0x60,
+        0x60,
+        0x60,  # 4  - group 1
+        0x70,
+        0x70,
+        0x70,  # 5
+        0x80,
+        0x80,
+        0x80,  # 6
+        0x90,
+        0x90,
+        0x90,  # 7
+        0x98,
+        0x98,
+        0x98,  # 8  - group 2
+        0xA0,
+        0xA0,
+        0xA0,  # 9
+        0xAA,
+        0xAA,
+        0xAA,  # 10
+        0xBB,
+        0xBB,
+        0xBB,  # 11
+        0xCC,
+        0xCC,
+        0xCC,  # 12 - group 3
+        0xDD,
+        0xDD,
+        0xDD,  # 13
+        0xEE,
+        0xEE,
+        0xEE,  # 14
+        0xFF,
+        0xFF,
+        0xFF,  # 15
+    ],
+) + bytes(240 * 3)  # pad to 256 entries
+
+
+def apply_palette_offsets(
+    tiles: list[Image.Image],
+    array_2d: list[list[TileEntry]],
+    palette: PaletteInfo,
+    stride: int = 4,
+) -> tuple[list[Image.Image], PaletteInfo, int]:
+    """Create per-(tile, palette-group) variants with remapped pixel indices.
+
+    For a tileset with *stride* colors per sub-palette, each tile used with
+    palette group P has its pixel indices shifted by ``P * stride`` so that
+    they land in the correct slot of the canonical 16-color grayscale table
+    (_SNES_GRAYSCALE_16).  SNES palette indices are compacted to a dense
+    0, 1, 2, … range so that only the groups actually referenced contribute
+    to the color count.  Tiles used with multiple palette groups are
+    duplicated.
+
+    *array_2d* is updated in-place.  Returns the expanded tile list, a new
+    PaletteInfo built from the canonical table, and the total color slot count.
+    """
+    # Decompose each SNES palette into:
+    #   PI  (palette index, output to TMX) = snes_pal // stride
+    #   CG  (color group, drives pixel offset) = snes_pal % stride
+    # Tiles with the same (tile_index, CG) are visually identical regardless
+    # of PI, so we deduplicate on (tile_index, CG).
+    used_cg_pairs: set[tuple[int, int]] = {
+        (e.index, e.palette % stride) for row in array_2d for e in row
+    }
+    sorted_cg_pairs = sorted(used_cg_pairs)
+    variant_map: dict[tuple[int, int], int] = {
+        pair: new_idx for new_idx, pair in enumerate(sorted_cg_pairs)
+    }
+
+    # Build one tile variant per (tile_index, CG) with pixel indices offset
+    # by CG * stride so they point into the correct slot of _SNES_GRAYSCALE_16.
+    new_tiles: list[Image.Image] = []
+    for old_idx, cg in sorted_cg_pairs:
+        offset = cg * stride
+        if offset == 0:
+            t = tiles[old_idx].copy()
+        else:
+            raw = tiles[old_idx].tobytes()
+            remapped = bytes(0 if px == 0 else px + offset for px in raw)
+            t = Image.frombytes("P", tiles[old_idx].size, remapped)
+        t.putpalette(_SNES_GRAYSCALE_16)
+        new_tiles.append(t)
+
+    # Update array_2d: tile index → variant, e.palette → PI = snes_pal // stride.
+    for row in array_2d:
+        for e in row:
+            cg = e.palette % stride
+            e.index = variant_map[(e.index, cg)]
+            e.palette = e.palette // stride - 2
+
+    num_groups = len(sorted_cg_pairs)
+
+    total_slots = num_groups * stride
+    print(
+        f"Palette expansion (stride={stride}): {len(new_tiles)} variant(s) "
+        f"from {len(tiles)} unique tile(s) across {num_groups} sub-palette(s) "
+        f"\u2192 {total_slots} color slots",
+    )
+
+    canonical_palette = PaletteInfo(
+        data=_SNES_GRAYSCALE_16,
+        transparency=palette.transparency,
+        num_colors=16,
+    )
+    return new_tiles, canonical_palette, total_slots
+
+
 def _new_image(
     mode: str,
     size: tuple[int, int],
@@ -361,11 +498,22 @@ def _new_image(
 
 
 def _save_image(img: Image.Image, out_path: Path, palette: PaletteInfo | None) -> None:
-    """Save *img* to *out_path*, injecting transparency metadata when present."""
-    if palette is not None and palette.transparency is not None:
-        img.save(out_path, transparency=palette.transparency)
-    else:
-        img.save(out_path)
+    """Save *img* to *out_path*, injecting transparency metadata when present.
+
+    For indexed images whose PaletteInfo carries num_colors, the PNG bit depth
+    is derived automatically (e.g. 16 colors → 4bpp) to avoid bloating the
+    palette chunk with unused black entries.
+    """
+    kwargs: dict = {}
+    if palette is not None:
+        if palette.transparency is not None:
+            kwargs["transparency"] = palette.transparency
+        if palette.num_colors is not None and palette.num_colors > 0:
+            bits = max(1, (palette.num_colors - 1).bit_length())
+            # Pillow PNG encoder accepts bits=1/2/4/8 for P-mode images.
+            if bits in (1, 2, 4, 8):
+                kwargs["bits"] = bits
+    img.save(out_path, **kwargs)
 
 
 def save_tileset(
@@ -426,6 +574,7 @@ def save_tiled(
     array_2d: list[list[TileEntry]],
     tile_count: int,
     stem_path: Path,
+    color_count: int = 8,
     tiles_per_row: int = 16,
 ) -> None:
     """Write a Tiled-compatible TSX tileset and TMX tilemap.
@@ -517,6 +666,9 @@ def save_tiled(
         f'    <data encoding="csv">{csv_data}    </data>',
         "  </layer>",
         '  <objectgroup id="2" name="Palette">',
+        "    <properties>",
+        f'      <property name="color_count" type="int" value="{color_count}"/>',
+        "    </properties>",
         *obj_lines,
         "  </objectgroup>",
         "</map>",
@@ -844,15 +996,22 @@ def main() -> None:
     if args.csv:
         save_csv(array_2d, stem_path)
 
-    tiles, palette = load_tiles(png_path)
+    tiles, palette, color_count = load_tiles(png_path)
     tiles = deduplicate_tiles(tiles, array_2d)
     tiles = remove_unused_tiles(tiles, array_2d)
+    if palette is not None and color_count == 4:
+        tiles, palette, color_count = apply_palette_offsets(
+            tiles,
+            array_2d,
+            palette,
+            stride=color_count,
+        )
     validate_indices(array_2d, len(tiles))
     tileset_out_path = stem_path.with_name(stem_path.stem + "_tileset.png")
     save_tileset(tiles, tileset_out_path, palette)
     if args.render:
         render_image(array_2d, tiles, stem_path.with_suffix(".png"), palette)
-    save_tiled(array_2d, len(tiles), stem_path)
+    save_tiled(array_2d, len(tiles), stem_path, color_count)
 
 
 if __name__ == "__main__":
