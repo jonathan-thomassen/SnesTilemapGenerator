@@ -845,8 +845,14 @@ def clean_tmx(tmx_path: Path) -> None:
         f"  <layer {layer_attrs}>",
         f'    <data encoding="csv">{csv_text}    </data>',
         "  </layer>",
-        "</map>",
     ]
+    # Re-serialize any objectgroup layers (e.g. palette data) from the parsed TMX.
+    for og_el in tmx_root.findall("objectgroup"):
+        ET.indent(og_el, space="  ")
+        og_str = ET.tostring(og_el, encoding="unicode")
+        # Indent the block by 2 spaces to match TMX nesting.
+        tmx_lines.append("\n".join("  " + line for line in og_str.splitlines()))
+    tmx_lines.append("</map>")
     tmx_path.write_text("\n".join(tmx_lines), encoding="UTF-8")
     print(f"Updated TMX saved to {tmx_path}")
 
