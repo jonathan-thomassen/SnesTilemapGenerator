@@ -1,5 +1,6 @@
 import argparse
 import csv
+import logging
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from pathlib import Path
 from PIL import Image
 
 TILE_SIZE = 8
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -110,20 +113,23 @@ def build_array_2d(
     return result
 
 
-def print_array_2d(array_2d: list[list[TileEntry]]) -> None:
+def log_array_2d(array_2d: list[list[TileEntry]]) -> None:
     rows = len(array_2d)
     cols = len(array_2d[0]) if rows else 0
-    print(f"\n2D array  ({rows} rows × {cols} columns):")
-    print("(H = h-flip, V = v-flip, P = palette)")
-    print("[")
+    lines = [
+        f"\n2D array  ({rows} rows × {cols} columns):",
+        "(H = h-flip, V = v-flip, P = palette)",
+        "[",
+    ]
     for r, row in enumerate(array_2d):
         cell_strs = [
             f"0x{e.index:02X}{'H' if e.hflip else ' '}{'V' if e.vflip else ' '}P{e.palette}"
             for e in row
         ]
         comma = "," if r < rows - 1 else ""
-        print(f"  [{', '.join(cell_strs)}]{comma}")
-    print("]")
+        lines.append(f"  [{', '.join(cell_strs)}]{comma}")
+    lines.append("]")
+    log.debug("%s", "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +154,7 @@ def save_xml(array_2d: list[list[TileEntry]], out_path: Path) -> None:
             tile_el.text = f"0x{e.index:02X}"
     ET.indent(root, space="  ")
     ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
-    print(f"Saved to {out_path}")
+    log.info("Saved to %s", out_path)
 
 
 def save_csv(array_2d: list[list[TileEntry]], stem_path: Path) -> None:
@@ -162,22 +168,22 @@ def save_csv(array_2d: list[list[TileEntry]], stem_path: Path) -> None:
         for row in array_2d:
             w.writerow([f"0x{e.index:02X}" for e in row])
 
-    with open(hflip_path, "w", newline="") as f:
+    with Path.open(hflip_path, "w", newline="") as f:
         w = csv.writer(f)
         for row in array_2d:
             w.writerow([int(e.hflip) for e in row])
 
-    with open(vflip_path, "w", newline="") as f:
+    with Path.open(vflip_path, "w", newline="") as f:
         w = csv.writer(f)
         for row in array_2d:
             w.writerow([int(e.vflip) for e in row])
 
-    with open(palette_path, "w", newline="") as f:
+    with Path.open(palette_path, "w", newline="") as f:
         w = csv.writer(f)
         for row in array_2d:
             w.writerow([e.palette for e in row])
 
-    print(f"Saved to {idx_path}, {hflip_path}, {vflip_path}, {palette_path}")
+    log.info("Saved to %s, %s, %s, %s", idx_path, hflip_path, vflip_path, palette_path)
 
 
 # ---------------------------------------------------------------------------
@@ -210,29 +216,36 @@ def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, i
             if pal_transparency is not None
             else ""
         )
-        print(
-            f"Tileset mode: Indexed Color (P) — palette preserved{trans_note}, {color_count} colors",
+        log.info(
+            "Tileset mode: Indexed Color (P) — palette preserved%s, %d colors",
+            trans_note,
+            color_count,
         )
     else:
         tileset = tileset.convert("RGBA")
         palette = None
         color_count = len(set(tileset.getdata()))
-        print(f"Tileset mode: {tileset.mode}")
+        log.info("Tileset mode: %s", tileset.mode)
 
     ts_w, ts_h = tileset.size
 
     if ts_w % TILE_SIZE != 0 or ts_h % TILE_SIZE != 0:
-        print(
-            f"Error: Tileset image size ({ts_w}×{ts_h}) is not a multiple of "
-            f"{TILE_SIZE}px in both dimensions.",
+        log.exception(
+            "Tileset image size (%d×%d) is not a multiple of %dpx in both dimensions.",
+            ts_w,
+            ts_h,
+            TILE_SIZE,
         )
         sys.exit(1)
 
     tiles_per_row = ts_w // TILE_SIZE
     tiles_per_col = ts_h // TILE_SIZE
-    print(
-        f"Tileset: {ts_w}×{ts_h} px → "
-        f"{tiles_per_row * tiles_per_col} tiles ({tiles_per_row} per row)",
+    log.info(
+        "Tileset: %d×%d px → %d tiles (%d per row)",
+        ts_w,
+        ts_h,
+        tiles_per_row * tiles_per_col,
+        tiles_per_row,
     )
 
     tiles: list[Image.Image] = []
@@ -294,9 +307,10 @@ def deduplicate_tiles(
             unique_variants.append((normal, hflipped, vflipped, hvflipped))
 
     removed = len(tiles) - len(unique_tiles)
-    print(
-        f"Deduplication: {removed} duplicates removed, "
-        f"{len(unique_tiles)} unique tiles remain",
+    log.info(
+        "Deduplication: %d duplicates removed, %d unique tiles remain",
+        removed,
+        len(unique_tiles),
     )
 
     # XOR existing flags with the required correction flags.
@@ -324,9 +338,15 @@ def validate_indices(array_2d: list[list[TileEntry]], tile_count: int) -> None:
     ]
     if bad:
         for r, c, idx in bad:
-            print(
-                f"Error: index 0x{idx:02X} ({idx}) at [{r}][{c}] is out of range "
-                f"(tileset has {tile_count} tiles, max index {tile_count - 1}).",
+            log.exception(
+                "Index 0x%02X (%d) at [%d][%d] is out of range "
+                "(tileset has %d tiles, max index %d).",
+                idx,
+                idx,
+                r,
+                c,
+                tile_count,
+                tile_count - 1,
             )
         sys.exit(1)
 
@@ -344,8 +364,10 @@ def remove_unused_tiles(
     # Build ordered list of used indices (preserves original order)
     kept = sorted(used)
     removed = len(tiles) - len(kept)
-    print(
-        f"Unused tile removal: {removed} unused tiles removed, {len(kept)} tiles remain",
+    log.info(
+        "Unused tile removal: %d unused tiles removed, %d tiles remain",
+        removed,
+        len(kept),
     )
 
     # Map old index → new compact index
@@ -471,10 +493,14 @@ def apply_palette_offsets(
     num_groups = len(sorted_cg_pairs)
 
     total_slots = num_groups * stride
-    print(
-        f"Palette expansion (stride={stride}): {len(new_tiles)} variant(s) "
-        f"from {len(tiles)} unique tile(s) across {num_groups} sub-palette(s) "
-        f"\u2192 {total_slots} color slots",
+    log.info(
+        "Palette expansion (stride=%d): %d variant(s) from %d unique tile(s) "
+        "across %d sub-palette(s) \u2192 %d color slots",
+        stride,
+        len(new_tiles),
+        len(tiles),
+        num_groups,
+        total_slots,
     )
 
     canonical_palette = PaletteInfo(
@@ -532,8 +558,12 @@ def save_tileset(
         ty = idx // cols
         img.paste(tile, (tx * TILE_SIZE, ty * TILE_SIZE))
     _save_image(img, out_path, palette)
-    print(
-        f"Tileset image ({len(tiles)} tiles, {cols * TILE_SIZE}×{rows * TILE_SIZE} px) saved to {out_path}",
+    log.info(
+        "Tileset image (%d tiles, %d×%d px) saved to %s",
+        len(tiles),
+        cols * TILE_SIZE,
+        rows * TILE_SIZE,
+        out_path,
     )
 
 
@@ -556,8 +586,11 @@ def render_image(
                 tile = tile.transpose(Image.FLIP_TOP_BOTTOM)
             out_img.paste(tile, (c * TILE_SIZE, r * TILE_SIZE))
     _save_image(out_img, out_path, palette)
-    print(
-        f"Output image ({cols * TILE_SIZE}×{rows * TILE_SIZE} px) saved to {out_path}",
+    log.info(
+        "Output image (%d×%d px) saved to %s",
+        cols * TILE_SIZE,
+        rows * TILE_SIZE,
+        out_path,
     )
 
 
@@ -574,7 +607,6 @@ def save_tiled(
     array_2d: list[list[TileEntry]],
     tile_count: int,
     stem_path: Path,
-    color_count: int = 8,
     tiles_per_row: int = 16,
 ) -> None:
     """Write a Tiled-compatible TSX tileset and TMX tilemap.
@@ -611,7 +643,7 @@ def save_tiled(
     )
     ET.indent(tsx_root, space="  ")
     ET.ElementTree(tsx_root).write(tsx_path, encoding="UTF-8", xml_declaration=True)
-    print(f"Saved Tiled tileset to {tsx_path}")
+    log.info("Saved Tiled tileset to %s", tsx_path)
 
     # --- TMX ---
     # Build CSV data: trailing comma on every row except the last (Tiled format).
@@ -666,15 +698,12 @@ def save_tiled(
         f'    <data encoding="csv">{csv_data}    </data>',
         "  </layer>",
         '  <objectgroup id="2" name="Palette">',
-        "    <properties>",
-        f'      <property name="color_count" type="int" value="{color_count}"/>',
-        "    </properties>",
         *obj_lines,
         "  </objectgroup>",
         "</map>",
     ]
     tmx_path.write_text("\n".join(tmx_lines), encoding="UTF-8")
-    print(f"Saved Tiled map to {tmx_path}")
+    log.info("Saved Tiled map to %s", tmx_path)
 
 
 # Tiled stores flip flags in the upper 3 bits of each GID.
@@ -686,29 +715,29 @@ _TILED_GID_MASK: int = 0x1FFFFFFF
 # ---------------------------------------------------------------------------
 
 
-def parse_tmx_gids(tmx_path: Path) -> tuple[ET.Element, ET.Element, list[int], int]:
+def parse_tmx_gids(tmx_path: Path) -> tuple[ET.Element, list[int], int]:
     """Parse a TMX file and return (map_root, data_el, flat_gids, firstgid)."""
     tree = ET.parse(tmx_path)
     root = tree.getroot()
 
     tileset_el = root.find("tileset")
     if tileset_el is None:
-        print("Error: No <tileset> element found in TMX.")
+        log.exception("No <tileset> element found in TMX.")
         sys.exit(1)
     firstgid = int(tileset_el.get("firstgid", "1"))
 
     layer = root.find("layer")
     if layer is None:
-        print("Error: No <layer> element found in TMX.")
+        log.exception("No <layer> element found in TMX.")
         sys.exit(1)
     data_el = layer.find("data")
     if data_el is None or data_el.get("encoding") != "csv":
-        print("Error: Only CSV-encoded TMX layers are supported.")
+        log.exception("Only CSV-encoded TMX layers are supported.")
         sys.exit(1)
 
     raw = (data_el.text or "").strip()
     gids = [int(v) for v in raw.replace("\n", "").split(",") if v.strip()]
-    return root, data_el, gids, firstgid
+    return root, gids, firstgid
 
 
 def clean_tmx(tmx_path: Path) -> None:
@@ -719,14 +748,15 @@ def clean_tmx(tmx_path: Path) -> None:
     tmx_dir = tmx_path.parent
 
     # --- Load TMX ---
-    tmx_root, data_el, gids, firstgid = parse_tmx_gids(tmx_path)
+    tmx_root, gids, firstgid = parse_tmx_gids(tmx_path)
 
     tileset_el = tmx_root.find("tileset")
-    assert tileset_el is not None
+    if tileset_el is None:
+        raise ValueError
     tsx_src = tileset_el.get("source", "")
     tsx_path = (tmx_dir / tsx_src).resolve()
     if not tsx_path.exists():
-        print(f"Error: TSX file '{tsx_path}' not found.")
+        log.exception("TSX file '%s' not found.", tsx_path)
         sys.exit(1)
 
     # --- Load TSX ---
@@ -737,17 +767,17 @@ def clean_tmx(tmx_path: Path) -> None:
 
     image_el = tsx_root_el.find("image")
     if image_el is None:
-        print("Error: No <image> element found in TSX.")
+        log.exception("No <image> element found in TSX.")
         sys.exit(1)
     img_src = image_el.get("source", "")
     img_path = (tsx_path.parent / img_src).resolve()
     if not img_path.exists():
-        print(f"Error: Tileset image '{img_path}' not found.")
+        log.exception("Tileset image '%s' not found.", img_path)
         sys.exit(1)
 
-    print(f"TMX:      {tmx_path}")
-    print(f"TSX:      {tsx_path}")
-    print(f"Tileset:  {img_path}  ({tile_count} tiles, {columns} columns)")
+    log.info("TMX:      %s", tmx_path)
+    log.info("TSX:      %s", tsx_path)
+    log.info("Tileset:  %s  (%d tiles, %d columns)", img_path, tile_count, columns)
 
     # --- Find used 0-based tile indices ---
     used: set[int] = set()
@@ -758,9 +788,9 @@ def clean_tmx(tmx_path: Path) -> None:
 
     unused_count = tile_count - len(used)
     if unused_count == 0:
-        print("No unused tiles found — nothing to do.")
+        log.info("No unused tiles found — nothing to do.")
         return
-    print(f"Found {unused_count} unused tile(s) out of {tile_count}; removing...")
+    log.info("Found %d unused tile(s) out of %d; removing...", unused_count, tile_count)
 
     # --- Load tileset image tiles ---
     tileset_img = Image.open(img_path)
@@ -772,8 +802,11 @@ def clean_tmx(tmx_path: Path) -> None:
         )
     ts_w, ts_h = tileset_img.size
     if ts_w % TILE_SIZE != 0 or ts_h % TILE_SIZE != 0:
-        print(
-            f"Error: Tileset image size ({ts_w}x{ts_h}) is not a multiple of {TILE_SIZE}px.",
+        log.exception(
+            "Tileset image size (%dx%d) is not a multiple of %dpx.",
+            ts_w,
+            ts_h,
+            TILE_SIZE,
         )
         sys.exit(1)
 
@@ -801,7 +834,8 @@ def clean_tmx(tmx_path: Path) -> None:
             new_gids.append(str(flags | (remap[base] + firstgid)))
 
     layer_el = tmx_root.find("layer")
-    assert layer_el is not None
+    if layer_el is None:
+        raise ValueError
     map_width = int(layer_el.get("width", "0"))
     rows_out = len(new_gids) // map_width if map_width else 0
     csv_rows: list[str] = []
@@ -824,7 +858,7 @@ def clean_tmx(tmx_path: Path) -> None:
         ty = new_idx // new_ts_cols
         new_img.paste(tiles[old_idx], (tx * TILE_SIZE, ty * TILE_SIZE))
     _save_image(new_img, img_path, palette)
-    print(f"Updated tileset image ({new_tile_count} tiles) saved to {img_path}")
+    log.info("Updated tileset image (%d tiles) saved to %s", new_tile_count, img_path)
 
     # --- Update TSX ---
     tsx_root_el.set("tilecount", str(new_tile_count))
@@ -833,7 +867,7 @@ def clean_tmx(tmx_path: Path) -> None:
     image_el.set("height", str(new_ts_rows * TILE_SIZE))
     ET.indent(tsx_root_el, space="  ")
     tsx_tree.write(tsx_path, encoding="UTF-8", xml_declaration=True)
-    print(f"Updated TSX saved to {tsx_path}")
+    log.info("Updated TSX saved to %s", tsx_path)
 
     # --- Save updated TMX (written as a string to preserve CSV integrity) ---
     map_attrs = " ".join(f'{k}="{v}"' for k, v in tmx_root.attrib.items())
@@ -854,9 +888,9 @@ def clean_tmx(tmx_path: Path) -> None:
         tmx_lines.append("\n".join("  " + line for line in og_str.splitlines()))
     tmx_lines.append("</map>")
     tmx_path.write_text("\n".join(tmx_lines), encoding="UTF-8")
-    print(f"Updated TMX saved to {tmx_path}")
+    log.info("Updated TMX saved to %s", tmx_path)
 
-    print(f"Done — removed {unused_count} unused tile(s).")
+    log.info("Done — removed %d unused tile(s).", unused_count)
 
 
 # ---------------------------------------------------------------------------
@@ -909,13 +943,24 @@ def main() -> None:
         action="store_true",
         help="Also render the composed map as a PNG image",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable debug-level logging (includes 2-D array dump)",
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
 
     # TMX clean mode: single .tmx argument
     if args.input.lower().endswith(".tmx"):
         tmx_path = Path(args.input)
         if not tmx_path.exists():
-            print(f"Error: File '{tmx_path}' not found.")
+            log.exception("File '%s' not found.", tmx_path)
             sys.exit(1)
         clean_tmx(tmx_path)
         return
@@ -927,27 +972,27 @@ def main() -> None:
     png_path = Path(args.tileset)
 
     if not png_path.exists():
-        print(f"Error: PNG file '{png_path}' not found.")
+        log.exception("PNG file '%s' not found.", png_path)
         sys.exit(1)
 
     try:
         values = parse_hex_file(filename)
     except FileNotFoundError:
-        print(f"Error: File '{filename}' not found.")
+        log.exception("File '%s' not found.", filename)
         sys.exit(1)
-    except ValueError as e:
-        print(f"Error: Invalid hex value in file — {e}")
+    except ValueError:
+        log.exception("Invalid hex value in file.")
         sys.exit(1)
 
     if len(values) % 2 != 0:
-        print(
-            f"Error: File has an odd number of bytes ({len(values)}); "
-            "cannot form complete 16-bit words.",
+        log.exception(
+            "File has an odd number of bytes (%d); cannot form complete 16-bit words.",
+            len(values),
         )
         sys.exit(1)
 
     entries = parse_entries(values)
-    print(f"Total tile entries: {len(entries)}")
+    log.info("Total tile entries: %d", len(entries))
 
     total = len(entries)
     if args.columns is not None and args.rows is not None:
@@ -962,7 +1007,7 @@ def main() -> None:
                 f"but file has {total} entries.",
             )
         cols = args.columns
-        print(f"Using {cols} columns \u00d7 {args.rows} rows.")
+        log.info("Using %d columns \u00d7 %d rows.", cols, args.rows)
     elif args.columns is not None:
         # Explicit columns only: derive rows = total / cols.
         if args.columns <= 0:
@@ -974,7 +1019,7 @@ def main() -> None:
                 f"(remainder: {total % args.columns}). Valid column counts: {valid}",
             )
         cols = args.columns
-        print(f"Using {cols} columns.")
+        log.info("Using %d columns.", cols)
     else:
         # Derive columns from --rows (default 32): screens are tiled horizontally.
         row_count = args.rows if args.rows is not None else 32
@@ -991,10 +1036,10 @@ def main() -> None:
         screen_info = (
             f" ({screens} screen(s) of 32\u00d7{row_count})" if cols % 32 == 0 else ""
         )
-        print(f"Using {cols} columns \u00d7 {row_count} rows{screen_info}.")
+        log.info("Using %d columns \u00d7 %d rows%s.", cols, row_count, screen_info)
 
     array_2d = build_array_2d(entries, cols)
-    print_array_2d(array_2d)
+    log_array_2d(array_2d)
 
     stem_path = Path(filename)
     if args.xml:
@@ -1017,7 +1062,7 @@ def main() -> None:
     save_tileset(tiles, tileset_out_path, palette)
     if args.render:
         render_image(array_2d, tiles, stem_path.with_suffix(".png"), palette)
-    save_tiled(array_2d, len(tiles), stem_path, color_count)
+    save_tiled(array_2d, len(tiles), stem_path)
 
 
 if __name__ == "__main__":
