@@ -662,28 +662,12 @@ def save_tiled(
 
     csv_data = "\n" + "\n".join(csv_rows) + "\n"
 
-    # --- Palette object layer ---
-    # Each cell becomes a transparent rectangle object carrying a "palette"
-    # custom property.  Object layers are the only Tiled construct that
-    # supports arbitrary per-cell custom properties.
-    obj_lines: list[str] = []
-    obj_id = 1
+    # --- Palette CSV layer ---
+    pal_rows: list[str] = []
     for r, row in enumerate(array_2d):
-        for c, e in enumerate(row):
-            x = c * TILE_SIZE
-            y = r * TILE_SIZE
-            obj_lines.append(
-                f'    <object id="{obj_id}" x="{x}" y="{y}"'
-                f' width="{TILE_SIZE}" height="{TILE_SIZE}">',
-            )
-            obj_lines.append("      <properties>")
-            obj_lines.append(
-                f'        <property name="palette" type="int" value="{e.palette}"/>',
-            )
-            obj_lines.append("      </properties>")
-            obj_lines.append("    </object>")
-            obj_id += 1
-    next_object_id = obj_id
+        pal_values = [str(e.palette) for e in row]
+        pal_rows.append(",".join(pal_values) + ("," if r < rows - 1 else ""))
+    pal_data = "\n" + "\n".join(pal_rows) + "\n"
 
     # Write TMX directly as a string to avoid ET.indent corrupting the CSV text.
     tmx_lines = [
@@ -692,14 +676,14 @@ def save_tiled(
         f' renderorder="right-down"'
         f' width="{cols}" height="{rows}"'
         f' tilewidth="{TILE_SIZE}" tileheight="{TILE_SIZE}"'
-        f' infinite="0" nextlayerid="3" nextobjectid="{next_object_id}">',
+        f' infinite="0" nextlayerid="3" nextobjectid="1">',
         f'  <tileset firstgid="1" source="{tsx_path.name}"/>',
         f'  <layer id="1" name="Tiles" width="{cols}" height="{rows}">',
         f'    <data encoding="csv">{csv_data}    </data>',
         "  </layer>",
-        '  <objectgroup id="2" name="Palette">',
-        *obj_lines,
-        "  </objectgroup>",
+        f'  <layer id="2" name="Palette" width="{cols}" height="{rows}">',
+        f'    <data encoding="csv">{pal_data}    </data>',
+        "  </layer>",
         "</map>",
     ]
     tmx_path.write_text("\n".join(tmx_lines), encoding="UTF-8")
@@ -880,12 +864,35 @@ def clean_tmx(tmx_path: Path) -> None:
         f'    <data encoding="csv">{csv_text}    </data>',
         "  </layer>",
     ]
-    # Re-serialize any objectgroup layers (e.g. palette data) from the parsed TMX.
-    for og_el in tmx_root.findall("objectgroup"):
-        ET.indent(og_el, space="  ")
-        og_str = ET.tostring(og_el, encoding="unicode")
-        # Indent the block by 2 spaces to match TMX nesting.
-        tmx_lines.append("\n".join("  " + line for line in og_str.splitlines()))
+    # Re-serialize any additional layers/objectgroups after the tile layer.
+    for child in tmx_root:
+        if child.tag == "tileset" or (child.tag == "layer" and child is layer_el):
+            continue
+        if child.tag == "layer":
+            data_sub = child.find("data")
+            if data_sub is not None and data_sub.get("encoding") == "csv":
+                child_attrs = " ".join(f'{k}="{v}"' for k, v in child.attrib.items())
+                # Strip and re-format CSV to our canonical style.
+                raw_csv_rows = [
+                    row.strip().rstrip(",")
+                    for row in (data_sub.text or "").splitlines()
+                    if row.strip()
+                ]
+                child_csv = (
+                    "\n"
+                    + "\n".join(
+                        row + ("," if i < len(raw_csv_rows) - 1 else "")
+                        for i, row in enumerate(raw_csv_rows)
+                    )
+                    + "\n"
+                )
+                tmx_lines.append(f"  <layer {child_attrs}>")
+                tmx_lines.append(f'    <data encoding="csv">{child_csv}    </data>')
+                tmx_lines.append("  </layer>")
+        elif child.tag == "objectgroup":
+            ET.indent(child, space="  ")
+            og_str = ET.tostring(child, encoding="unicode")
+            tmx_lines.append("\n".join("  " + line for line in og_str.splitlines()))
     tmx_lines.append("</map>")
     tmx_path.write_text("\n".join(tmx_lines), encoding="UTF-8")
     log.info("Updated TMX saved to %s", tmx_path)
