@@ -42,13 +42,12 @@ class PaletteInfo:
 
 def parse_hex_file(filename: str) -> list[int]:
     values: list[int] = []
-    with open(filename) as f:
+    with Path.open(filename) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            for token in line.split():
-                values.append(int(token, 16))
+            values.extend(int(token, 16) for token in line.split())
     return values
 
 
@@ -269,7 +268,6 @@ def deduplicate_tiles(
     unique_tiles: list[Image.Image] = []
     # Per unique tile: cached bytes for all four flip variants
     unique_variants: list[tuple[bytes, bytes, bytes, bytes]] = []
-    # remap[orig_idx] = (canonical_idx, needs_hflip, needs_vflip)
     remap: dict[int, tuple[int, bool, bool]] = {}
 
     for orig_idx, tile in enumerate(tiles):
@@ -908,16 +906,24 @@ def clean_tmx(tmx_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="parse_tilemap.py",
-        description="Parse an SNES tilemap hex file or clean an existing TMX.",
+        description=(
+            "Parse an SNES tilemap hex file or clean an existing TMX.\n\n"
+            "Modes:\n"
+            "  pipeline : parse_tilemap.py map.txt tileset.png\n"
+            "  stitch   : parse_tilemap.py map1.txt [map2.txt ...] tileset.png\n"
+            "  clean    : parse_tilemap.py map.tmx"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "input",
-        help="Tilemap .txt file (pipeline mode) or .tmx file (clean mode)",
-    )
-    parser.add_argument(
-        "tileset",
-        nargs="?",
-        help="Tileset PNG — required for pipeline mode",
+        "files",
+        nargs="+",
+        metavar="FILE",
+        help=(
+            "pipeline: <map.txt> <tileset.png>  |  "
+            "stitch: <map1.txt> [map2.txt ...] <tileset.png>  |  "
+            "clean: <map.tmx>"
+        ),
     )
     parser.add_argument(
         "-c",
@@ -951,6 +957,16 @@ def main() -> None:
         help="Also render the composed map as a PNG image",
     )
     parser.add_argument(
+        "--deduplicate",
+        action="store_true",
+        help="Remove duplicate tiles (including flipped variants) from the tileset",
+    )
+    parser.add_argument(
+        "--remove-unused",
+        action="store_true",
+        help="Remove tiles not referenced by any map cell",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -963,100 +979,157 @@ def main() -> None:
         format="%(levelname)s: %(message)s",
     )
 
-    # TMX clean mode: single .tmx argument
-    if args.input.lower().endswith(".tmx"):
-        tmx_path = Path(args.input)
+    # -----------------------------------------------------------------------
+    # Mode detection from file extensions
+    # -----------------------------------------------------------------------
+    files = args.files
+    if len(files) == 1 and files[0].lower().endswith(".tmx"):
+        # --- Clean mode ---
+        tmx_path = Path(files[0])
         if not tmx_path.exists():
-            log.exception("File '%s' not found.", tmx_path)
+            log.error("File '%s' not found.", tmx_path)
             sys.exit(1)
         clean_tmx(tmx_path)
         return
 
-    if args.tileset is None:
-        parser.error("a tileset PNG is required in pipeline mode")
-
-    filename = args.input
-    png_path = Path(args.tileset)
-
-    if not png_path.exists():
-        log.exception("PNG file '%s' not found.", png_path)
-        sys.exit(1)
-
-    try:
-        values = parse_hex_file(filename)
-    except FileNotFoundError:
-        log.exception("File '%s' not found.", filename)
-        sys.exit(1)
-    except ValueError:
-        log.exception("Invalid hex value in file.")
-        sys.exit(1)
-
-    if len(values) % 2 != 0:
-        log.exception(
-            "File has an odd number of bytes (%d); cannot form complete 16-bit words.",
-            len(values),
-        )
-        sys.exit(1)
-
-    entries = parse_entries(values)
-    log.info("Total tile entries: %d", len(entries))
-
-    total = len(entries)
-    if args.columns is not None and args.rows is not None:
-        # Both explicitly provided: validate they account for all entries.
-        if args.columns <= 0:
-            parser.error("-c/--columns must be a positive integer")
-        if args.rows <= 0:
-            parser.error("-r/--rows must be a positive integer")
-        if args.columns * args.rows != total:
-            parser.error(
-                f"-c {args.columns} \u00d7 -r {args.rows} = {args.columns * args.rows} "
-                f"but file has {total} entries.",
+    if len(files) >= 3 and files[-1].lower().endswith(".png"):
+        # --- Stitch mode: map1.txt [map2.txt ...] tileset.png ---
+        txt_files = files[:-1]
+        png_arg = files[-1]
+        png_path = Path(png_arg)
+        if not png_path.exists():
+            log.error("PNG file '%s' not found.", png_path)
+            sys.exit(1)
+        all_values: list[list[int]] = []
+        for txt_file in txt_files:
+            try:
+                all_values.append(parse_hex_file(txt_file))
+            except FileNotFoundError:
+                log.error("File '%s' not found.", txt_file)
+                sys.exit(1)
+            except ValueError:
+                log.exception("Invalid hex value in '%s'.", txt_file)
+                sys.exit(1)
+        values = [v for part in all_values for v in part]
+        if len(values) % 2 != 0:
+            log.error(
+                "Combined data has an odd number of bytes (%d); cannot form complete 16-bit words.",
+                len(values),
             )
-        cols = args.columns
-        log.info("Using %d columns \u00d7 %d rows.", cols, args.rows)
-    elif args.columns is not None:
-        # Explicit columns only: derive rows = total / cols.
-        if args.columns <= 0:
-            parser.error("-c/--columns must be a positive integer")
-        if total % args.columns != 0:
-            valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
-            parser.error(
-                f"{total} entries cannot be evenly divided into {args.columns} columns "
-                f"(remainder: {total % args.columns}). Valid column counts: {valid}",
-            )
-        cols = args.columns
-        log.info("Using %d columns.", cols)
-    else:
-        # Derive columns from --rows (default 32): screens are tiled horizontally.
+            sys.exit(1)
+        entries = parse_entries(values)
         row_count = args.rows if args.rows is not None else 32
-        if row_count <= 0:
-            parser.error("-r/--rows must be a positive integer")
-        if total % row_count != 0:
-            valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
+        if len(entries) % row_count != 0:
             parser.error(
-                f"{total} entries cannot be evenly divided into {row_count} rows "
-                f"(remainder: {total % row_count}). Valid row counts: {valid}",
+                f"Stitched entry count {len(entries)} is not divisible by {row_count} rows.",
             )
-        cols = total // row_count
-        screens = cols // 32 if cols % 32 == 0 else cols
-        screen_info = (
-            f" ({screens} screen(s) of 32\u00d7{row_count})" if cols % 32 == 0 else ""
+        cols = len(entries) // row_count
+        counts_str = " + ".join(str(len(v) // 2) for v in all_values)
+        log.info(
+            "Total tile entries after stitch: %d (%s) \u2192 %d columns \u00d7 %d rows.",
+            len(entries),
+            counts_str,
+            cols,
+            row_count,
         )
-        log.info("Using %d columns \u00d7 %d rows%s.", cols, row_count, screen_info)
+        stems = [Path(f).stem for f in txt_files]
+        stem_path = Path(txt_files[0]).with_name("_".join(stems) + "_stitched")
+        filename = str(stem_path)
+    elif len(files) == 2 and files[1].lower().endswith(".png"):
+        # --- Pipeline mode: map.txt tileset.png ---
+        filename, png_arg = files[0], files[1]
+        png_path = Path(png_arg)
+        if not png_path.exists():
+            log.error("PNG file '%s' not found.", png_path)
+            sys.exit(1)
+        try:
+            values = parse_hex_file(filename)
+        except FileNotFoundError:
+            log.error("File '%s' not found.", filename)
+            sys.exit(1)
+        except ValueError:
+            log.exception("Invalid hex value in file.")
+            sys.exit(1)
+        if len(values) % 2 != 0:
+            log.error(
+                "File has an odd number of bytes (%d); cannot form complete 16-bit words.",
+                len(values),
+            )
+            sys.exit(1)
+        entries = parse_entries(values)
+        log.info("Total tile entries: %d", len(entries))
+        stem_path = Path(filename)
+    else:
+        parser.error(
+            "expected one of:\n"
+            "  pipeline : <map.txt> <tileset.png>\n"
+            "  stitch   : <map1.txt> [map2.txt ...] <tileset.png>\n"
+            "  clean    : <map.tmx>",
+        )
+
+    # -----------------------------------------------------------------------
+    # Column / row resolution (pipeline mode only; stitch fixes cols=128)
+    # -----------------------------------------------------------------------
+    if len(files) == 2:
+        total = len(entries)
+        if args.columns is not None and args.rows is not None:
+            # Both explicitly provided: validate they account for all entries.
+            if args.columns <= 0:
+                parser.error("-c/--columns must be a positive integer")
+            if args.rows <= 0:
+                parser.error("-r/--rows must be a positive integer")
+            if args.columns * args.rows != total:
+                parser.error(
+                    f"-c {args.columns} \u00d7 -r {args.rows} = {args.columns * args.rows} "
+                    f"but file has {total} entries.",
+                )
+            cols = args.columns
+            log.info("Using %d columns \u00d7 %d rows.", cols, args.rows)
+        elif args.columns is not None:
+            # Explicit columns only: derive rows = total / cols.
+            if args.columns <= 0:
+                parser.error("-c/--columns must be a positive integer")
+            if total % args.columns != 0:
+                valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
+                parser.error(
+                    f"{total} entries cannot be evenly divided into {args.columns} columns "
+                    f"(remainder: {total % args.columns}). Valid column counts: {valid}",
+                )
+            cols = args.columns
+            log.info("Using %d columns.", cols)
+        else:
+            # Derive columns from --rows (default 32): screens are tiled horizontally.
+            row_count = args.rows if args.rows is not None else 32
+            if row_count <= 0:
+                parser.error("-r/--rows must be a positive integer")
+            if total % row_count != 0:
+                valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
+                parser.error(
+                    f"{total} entries cannot be evenly divided into {row_count} rows "
+                    f"(remainder: {total % row_count}). Valid row counts: {valid}",
+                )
+            cols = total // row_count
+            screens = cols // 32 if cols % 32 == 0 else cols
+            screen_info = (
+                f" ({screens} screen(s) of 32\u00d7{row_count})"
+                if cols % 32 == 0
+                else ""
+            )
+            log.info("Using %d columns \u00d7 %d rows%s.", cols, row_count, screen_info)
 
     array_2d = build_array_2d(entries, cols)
     log_array_2d(array_2d)
 
-    stem_path = Path(filename)
     if args.xml:
         save_xml(array_2d, stem_path.with_suffix(".xml"))
     if args.csv:
         save_csv(array_2d, stem_path)
 
     tiles, palette, color_count = load_tiles(png_path)
-    tiles = deduplicate_tiles(tiles, array_2d)
-    tiles = remove_unused_tiles(tiles, array_2d)
+    if args.deduplicate:
+        tiles = deduplicate_tiles(tiles, array_2d)
+    if args.remove_unused:
+        tiles = remove_unused_tiles(tiles, array_2d)
     if palette is not None and color_count == 4:
         tiles, palette, color_count = apply_palette_offsets(
             tiles,
