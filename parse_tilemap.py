@@ -1,11 +1,46 @@
+"""parse_tilemap.py — SNES tilemap hex → Tiled asset pipeline.
+
+Three operating modes, selected automatically from the arguments:
+
+  pipeline  parse a single SNES tilemap .txt file together with its
+            tileset PNG and produce a Tiled TMX/TSX pair.
+
+            python parse_tilemap.py map.txt tileset.png
+
+  stitch    concatenate two or more SNES tilemap .txt files side-by-side
+            to form a wider multi-screen map (128, 192, … columns), then
+            run the same pipeline on the combined data.
+
+            python parse_tilemap.py map1.txt map2.txt tileset.png
+
+  clean     remove unused tiles from an existing TMX/TSX/PNG triple
+            in-place, compacting the tileset and remapping all GIDs.
+
+            python parse_tilemap.py map.tmx
+
+SNES tilemap format
+-------------------
+Each map cell is a 16-bit little-endian word:
+  low byte         — low 8 bits of tile index
+  high byte bit 0  — bit 8 of tile index (+0x100)
+  high byte bits 2-5 — palette index (0-15)
+  high byte bit 6  — horizontal flip
+  high byte bit 7  — vertical flip
+All tile indices have a base offset of 0x200 applied on read.
+
+SNES screens are 32x32 tiles.  Multi-screen maps store each screen
+sequentially; ``build_array_2d`` interleaves them back into a single
+continuous row-major grid.
+"""
+
 import argparse
 import csv
 import logging
 import sys
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
+from defusedxml import ElementTree
 from PIL import Image
 
 TILE_SIZE = 8
@@ -20,6 +55,18 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class TileEntry:
+    """One cell in an SNES tilemap.
+
+    Attributes:
+        index:   Zero-based tile index within the tileset image.
+        hflip:   Horizontal flip flag.
+        vflip:   Vertical flip flag.
+        palette: SNES palette index (0-15 raw; re-interpreted as a
+                 palette-index / color-group pair by
+                 ``apply_palette_offsets``).
+
+    """
+
     index: int
     hflip: bool
     vflip: bool
@@ -28,7 +75,20 @@ class TileEntry:
 
 @dataclass
 class PaletteInfo:
-    """Indexed-color palette data, including optional transparency index."""
+    """Indexed-color palette data for a Pillow ``'P'``-mode image.
+
+    Attributes:
+        data:         Flat RGB bytes for every palette entry, padded to
+                      256 entries (768 bytes) as required by Pillow's
+                      ``putpalette``.
+        transparency: Transparency index (int) or alpha bytes object to
+                      pass directly to Pillow / PNG.  ``None`` if the
+                      image has no transparency.
+        num_colors:   Number of meaningful palette entries (e.g. 4 for a
+                      2bpp tileset, 16 for a 4bpp one).  Used to derive
+                      the PNG bit depth when saving.
+
+    """
 
     data: bytes
     transparency: int | bytes | None = None
@@ -41,13 +101,22 @@ class PaletteInfo:
 
 
 def parse_hex_file(filename: str) -> list[int]:
+    """Read whitespace-separated hexadecimal byte tokens from *filename*.
+
+    Each token must be a valid base-16 integer (e.g. ``0x3A`` or ``3A``).
+    Empty lines and leading/trailing whitespace are ignored.
+
+    Returns:
+        A flat list of integer byte values in file order.
+
+    """
     values: list[int] = []
     with Path.open(filename) as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            line_stripped = line.strip()
+            if not line_stripped:
                 continue
-            values.extend(int(token, 16) for token in line.split())
+            values.extend(int(token, 16) for token in line_stripped.split())
     return values
 
 
@@ -113,16 +182,24 @@ def build_array_2d(
 
 
 def log_array_2d(array_2d: list[list[TileEntry]]) -> None:
+    """Emit a formatted dump of *array_2d* at DEBUG log level.
+
+    Each cell is rendered as ``0xINDEXH V P<pal>`` where ``H``/``V``
+    are shown only when the corresponding flip flag is set.  The output
+    is emitted as a single ``log.debug`` call so it is suppressed unless
+    ``--verbose`` is passed.
+    """
     rows = len(array_2d)
     cols = len(array_2d[0]) if rows else 0
     lines = [
-        f"\n2D array  ({rows} rows × {cols} columns):",
+        f"\n2D array  ({rows} rows x {cols} columns):",
         "(H = h-flip, V = v-flip, P = palette)",
         "[",
     ]
     for r, row in enumerate(array_2d):
         cell_strs = [
-            f"0x{e.index:02X}{'H' if e.hflip else ' '}{'V' if e.vflip else ' '}P{e.palette}"
+            f"0x{e.index:02X}{'H' if e.hflip else ' '}"
+            f"{'V' if e.vflip else ' '}P{e.palette}"
             for e in row
         ]
         comma = "," if r < rows - 1 else ""
@@ -137,13 +214,19 @@ def log_array_2d(array_2d: list[list[TileEntry]]) -> None:
 
 
 def save_xml(array_2d: list[list[TileEntry]], out_path: Path) -> None:
+    """Serialise *array_2d* to an XML file at *out_path*.
+
+    The root element is ``<tilemap rows=… cols=…>``.  Each row becomes a
+    ``<row index=…>`` element containing ``<tile hflip=… vflip=…
+    palette=…>0xINDEX</tile>`` children.
+    """
     rows = len(array_2d)
     cols = len(array_2d[0]) if rows else 0
-    root = ET.Element("tilemap", rows=str(rows), cols=str(cols))
+    root = ElementTree.Element("tilemap", rows=str(rows), cols=str(cols))
     for r, row in enumerate(array_2d):
-        row_el = ET.SubElement(root, "row", index=str(r))
+        row_el = ElementTree.SubElement(root, "row", index=str(r))
         for e in row:
-            tile_el = ET.SubElement(
+            tile_el = ElementTree.SubElement(
                 row_el,
                 "tile",
                 hflip="1" if e.hflip else "0",
@@ -151,12 +234,24 @@ def save_xml(array_2d: list[list[TileEntry]], out_path: Path) -> None:
                 palette=str(e.palette),
             )
             tile_el.text = f"0x{e.index:02X}"
-    ET.indent(root, space="  ")
-    ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
+    ElementTree.indent(root, space="  ")
+    ElementTree.ElementTree(root).write(
+        out_path,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
     log.info("Saved to %s", out_path)
 
 
 def save_csv(array_2d: list[list[TileEntry]], stem_path: Path) -> None:
+    """Write per-cell data from *array_2d* to four CSV files.
+
+    Files written (derived from *stem_path*):
+      * ``<stem>.csv``          — tile indices (hex)
+      * ``<stem>_hflip.csv``   — horizontal-flip flags (0/1)
+      * ``<stem>_vflip.csv``   — vertical-flip flags (0/1)
+      * ``<stem>_palette.csv`` — palette indices
+    """
     idx_path = stem_path.with_suffix(".csv")
     hflip_path = stem_path.with_name(stem_path.stem + "_hflip.csv")
     vflip_path = stem_path.with_name(stem_path.stem + "_vflip.csv")
@@ -191,7 +286,7 @@ def save_csv(array_2d: list[list[TileEntry]], stem_path: Path) -> None:
 
 
 def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, int]:
-    """Slice a tileset PNG into TILE_SIZE×TILE_SIZE images.
+    """Slice a tileset PNG into TILE_SIZExTILE_SIZE images.
 
     If the source image is in Indexed Color Mode ("P"), the palette and any
     transparency index are preserved in a PaletteInfo so output images can be
@@ -230,7 +325,7 @@ def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, i
 
     if ts_w % TILE_SIZE != 0 or ts_h % TILE_SIZE != 0:
         log.exception(
-            "Tileset image size (%d×%d) is not a multiple of %dpx in both dimensions.",
+            "Tileset image size (%dx%d) is not a multiple of %dpx in both dimensions.",
             ts_w,
             ts_h,
             TILE_SIZE,
@@ -240,7 +335,7 @@ def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, i
     tiles_per_row = ts_w // TILE_SIZE
     tiles_per_col = ts_h // TILE_SIZE
     log.info(
-        "Tileset: %d×%d px → %d tiles (%d per row)",
+        "Tileset: %dx%d px → %d tiles (%d per row)",
         ts_w,
         ts_h,
         tiles_per_row * tiles_per_col,
@@ -266,43 +361,32 @@ def deduplicate_tiles(
     Returns the deduplicated tile list.
     """
     unique_tiles: list[Image.Image] = []
-    # Per unique tile: cached bytes for all four flip variants
-    unique_variants: list[tuple[bytes, bytes, bytes, bytes]] = []
+    # Maps raw pixel bytes of any flip variant → (canonical_idx, hflip, vflip).
+    # Every new unique tile registers all four variants at once, so lookups
+    # are O(1) and no inner loop is required.
+    variant_lookup: dict[bytes, tuple[int, bool, bool]] = {}
     remap: dict[int, tuple[int, bool, bool]] = {}
 
     for orig_idx, tile in enumerate(tiles):
         normal = tile.tobytes()
-        hflipped = tile.transpose(Image.FLIP_LEFT_RIGHT).tobytes()
-        vflipped = tile.transpose(Image.FLIP_TOP_BOTTOM).tobytes()
-        hvflipped = (
-            tile.transpose(Image.FLIP_LEFT_RIGHT)
-            .transpose(Image.FLIP_TOP_BOTTOM)
-            .tobytes()
-        )
-
-        matched = False
-        for new_idx, (vn, vh, vv, vhv) in enumerate(unique_variants):
-            if normal == vn:
-                remap[orig_idx] = (new_idx, False, False)
-                matched = True
-                break
-            if normal == vh:
-                remap[orig_idx] = (new_idx, True, False)
-                matched = True
-                break
-            if normal == vv:
-                remap[orig_idx] = (new_idx, False, True)
-                matched = True
-                break
-            if normal == vhv:
-                remap[orig_idx] = (new_idx, True, True)
-                matched = True
-                break
-
-        if not matched:
-            remap[orig_idx] = (len(unique_tiles), False, False)
+        match = variant_lookup.get(normal)
+        if match is not None:
+            remap[orig_idx] = match
+        else:
+            new_idx = len(unique_tiles)
+            remap[orig_idx] = (new_idx, False, False)
             unique_tiles.append(tile)
-            unique_variants.append((normal, hflipped, vflipped, hvflipped))
+            hflipped = tile.transpose(Image.FLIP_LEFT_RIGHT).tobytes()
+            vflipped = tile.transpose(Image.FLIP_TOP_BOTTOM).tobytes()
+            hvflipped = (
+                tile.transpose(Image.FLIP_LEFT_RIGHT)
+                .transpose(Image.FLIP_TOP_BOTTOM)
+                .tobytes()
+            )
+            variant_lookup[normal] = (new_idx, False, False)
+            variant_lookup[hflipped] = (new_idx, True, False)
+            variant_lookup[vflipped] = (new_idx, False, True)
+            variant_lookup[hvflipped] = (new_idx, True, True)
 
     removed = len(tiles) - len(unique_tiles)
     log.info(
@@ -328,6 +412,11 @@ def deduplicate_tiles(
 
 
 def validate_indices(array_2d: list[list[TileEntry]], tile_count: int) -> None:
+    """Verify every tile index in *array_2d* is within ``[0, tile_count)``.
+
+    Logs an error for each out-of-range cell and calls ``sys.exit(1)``
+    if any are found.
+    """
     bad = [
         (r, c, e.index)
         for r, row in enumerate(array_2d)
@@ -546,7 +635,14 @@ def save_tileset(
     palette: PaletteInfo | None,
     tiles_per_row: int = 16,
 ) -> None:
-    """Save the (deduplicated) tile list back out as a tileset PNG."""
+    """Pack *tiles* into a grid PNG and save it to *out_path*.
+
+    Tiles are arranged left-to-right, top-to-bottom with up to
+    *tiles_per_row* columns.  The image mode and bit depth are derived
+    from *palette*: ``'P'`` (indexed) when a palette is provided,
+    ``'RGBA'`` otherwise.  Transparency and bit-depth hints from
+    *palette* are forwarded to the PNG encoder via ``_save_image``.
+    """
     mode = "P" if palette is not None else "RGBA"
     cols = min(tiles_per_row, len(tiles))
     rows = -(-len(tiles) // cols)  # ceiling division
@@ -557,7 +653,7 @@ def save_tileset(
         img.paste(tile, (tx * TILE_SIZE, ty * TILE_SIZE))
     _save_image(img, out_path, palette)
     log.info(
-        "Tileset image (%d tiles, %d×%d px) saved to %s",
+        "Tileset image (%d tiles, %dx%d px) saved to %s",
         len(tiles),
         cols * TILE_SIZE,
         rows * TILE_SIZE,
@@ -571,6 +667,13 @@ def render_image(
     out_path: Path,
     palette: PaletteInfo | None,
 ) -> None:
+    """Compose the full tilemap into a single PNG and save it to *out_path*.
+
+    Each cell in *array_2d* is looked up in *tiles* and pasted at the
+    correct pixel position, with flip transforms applied.  The output
+    image uses mode ``'P'`` when *palette* is provided, otherwise
+    ``'RGBA'``.
+    """
     mode = "P" if palette is not None else "RGBA"
     rows = len(array_2d)
     cols = len(array_2d[0]) if rows else 0
@@ -585,7 +688,7 @@ def render_image(
             out_img.paste(tile, (c * TILE_SIZE, r * TILE_SIZE))
     _save_image(out_img, out_path, palette)
     log.info(
-        "Output image (%d×%d px) saved to %s",
+        "Output image (%dx%d px) saved to %s",
         cols * TILE_SIZE,
         rows * TILE_SIZE,
         out_path,
@@ -623,7 +726,7 @@ def save_tiled(
     tmx_path = stem_path.with_suffix(".tmx")
 
     # --- TSX ---
-    tsx_root = ET.Element(
+    tsx_root = ElementTree.Element(
         "tileset",
         version="1.10",
         name=name,
@@ -632,15 +735,19 @@ def save_tiled(
         tilecount=str(tile_count),
         columns=str(ts_cols),
     )
-    ET.SubElement(
+    ElementTree.SubElement(
         tsx_root,
         "image",
         source=tileset_png_name,
         width=str(ts_cols * TILE_SIZE),
         height=str(ts_rows * TILE_SIZE),
     )
-    ET.indent(tsx_root, space="  ")
-    ET.ElementTree(tsx_root).write(tsx_path, encoding="UTF-8", xml_declaration=True)
+    ElementTree.indent(tsx_root, space="  ")
+    ElementTree.ElementTree(tsx_root).write(
+        tsx_path,
+        encoding="UTF-8",
+        xml_declaration=True,
+    )
     log.info("Saved Tiled tileset to %s", tsx_path)
 
     # --- TMX ---
@@ -667,7 +774,7 @@ def save_tiled(
         pal_rows.append(",".join(pal_values) + ("," if r < rows - 1 else ""))
     pal_data = "\n" + "\n".join(pal_rows) + "\n"
 
-    # Write TMX directly as a string to avoid ET.indent corrupting the CSV text.
+    # Write TMX directly as a string to avoid ElementTree.indent corrupting the CSV.
     tmx_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<map version="1.10" tiledversion="1.10.2" orientation="orthogonal"'
@@ -697,9 +804,23 @@ _TILED_GID_MASK: int = 0x1FFFFFFF
 # ---------------------------------------------------------------------------
 
 
-def parse_tmx_gids(tmx_path: Path) -> tuple[ET.Element, list[int], int]:
-    """Parse a TMX file and return (map_root, data_el, flat_gids, firstgid)."""
-    tree = ET.parse(tmx_path)
+def parse_tmx_gids(tmx_path: Path) -> tuple[ElementTree.Element, list[int], int]:
+    """Parse *tmx_path* and extract the tile-layer GID list.
+
+    Reads the first ``<tileset>`` and ``<layer>`` elements; the layer
+    must use CSV encoding.  Exits with an error message if either
+    element is missing or the encoding is unsupported.
+
+    Returns:
+        A 3-tuple ``(map_root, flat_gids, firstgid)`` where:
+
+        * ``map_root``  — the parsed ``<map>`` ``Element`` (full tree).
+        * ``flat_gids`` — flat list of raw 32-bit GID values in row-major
+          order (flip bits preserved in the upper bits).
+        * ``firstgid``  — the ``firstgid`` attribute of the tileset element.
+
+    """
+    tree = ElementTree.parse(tmx_path)
     root = tree.getroot()
 
     tileset_el = root.find("tileset")
@@ -722,27 +843,30 @@ def parse_tmx_gids(tmx_path: Path) -> tuple[ET.Element, list[int], int]:
     return root, gids, firstgid
 
 
-def clean_tmx(tmx_path: Path) -> None:
-    """Remove unused tiles from the tileset referenced by a TMX file.
+def _load_tsx(
+    tmx_dir: Path,
+    tileset_el: ElementTree.Element,
+) -> tuple[
+    ElementTree.ElementTree,
+    ElementTree.Element,
+    Path,
+    int,
+    int,
+    ElementTree.Element,
+    Path,
+]:
+    """Load and validate the TSX file referenced by *tileset_el*.
 
-    Updates the tileset image, TSX, and TMX in-place.
+    Returns ``(tsx_tree, tsx_root_el, tsx_path, columns, tile_count,
+    image_el, img_path)``.  Exits on any missing file or element.
     """
-    tmx_dir = tmx_path.parent
-
-    # --- Load TMX ---
-    tmx_root, gids, firstgid = parse_tmx_gids(tmx_path)
-
-    tileset_el = tmx_root.find("tileset")
-    if tileset_el is None:
-        raise ValueError
     tsx_src = tileset_el.get("source", "")
     tsx_path = (tmx_dir / tsx_src).resolve()
     if not tsx_path.exists():
         log.exception("TSX file '%s' not found.", tsx_path)
         sys.exit(1)
 
-    # --- Load TSX ---
-    tsx_tree = ET.parse(tsx_path)
+    tsx_tree = ElementTree.parse(tsx_path)
     tsx_root_el = tsx_tree.getroot()
     columns = int(tsx_root_el.get("columns", "16"))
     tile_count = int(tsx_root_el.get("tilecount", "0"))
@@ -756,28 +880,21 @@ def clean_tmx(tmx_path: Path) -> None:
     if not img_path.exists():
         log.exception("Tileset image '%s' not found.", img_path)
         sys.exit(1)
+    return tsx_tree, tsx_root_el, tsx_path, columns, tile_count, image_el, img_path
 
-    log.info("TMX:      %s", tmx_path)
-    log.info("TSX:      %s", tsx_path)
-    log.info("Tileset:  %s  (%d tiles, %d columns)", img_path, tile_count, columns)
 
-    # --- Find used 0-based tile indices ---
-    used: set[int] = set()
-    for gid in gids:
-        base = (gid & _TILED_GID_MASK) - firstgid
-        if base >= 0:  # negative means empty tile (gid=0)
-            used.add(base)
+def _slice_tileset_image(
+    img_path: Path,
+) -> tuple[list[Image.Image], PaletteInfo | None, str]:
+    """Open *img_path*, extract palette info, and slice into TILE_SIZE tiles.
 
-    unused_count = tile_count - len(used)
-    if unused_count == 0:
-        log.info("No unused tiles found — nothing to do.")
-        return
-    log.info("Found %d unused tile(s) out of %d; removing...", unused_count, tile_count)
-
-    # --- Load tileset image tiles ---
+    Returns ``(tiles, palette, src_mode)`` where *palette* is ``None`` for
+    non-indexed images and *src_mode* is the original Pillow image mode.
+    """
     tileset_img = Image.open(img_path)
+    src_mode = tileset_img.mode
     palette: PaletteInfo | None = None
-    if tileset_img.mode == "P":
+    if src_mode == "P":
         palette = PaletteInfo(
             data=bytes(tileset_img.getpalette() or []),
             transparency=tileset_img.info.get("transparency"),
@@ -791,67 +908,173 @@ def clean_tmx(tmx_path: Path) -> None:
             TILE_SIZE,
         )
         sys.exit(1)
-
-    tiles_per_row = ts_w // TILE_SIZE
-    tiles_per_col = ts_h // TILE_SIZE
     tiles: list[Image.Image] = []
-    for ty in range(tiles_per_col):
-        for tx in range(tiles_per_row):
+    for ty in range(ts_h // TILE_SIZE):
+        for tx in range(ts_w // TILE_SIZE):
             x0, y0 = tx * TILE_SIZE, ty * TILE_SIZE
             tiles.append(tileset_img.crop((x0, y0, x0 + TILE_SIZE, y0 + TILE_SIZE)))
+    return tiles, palette, src_mode
 
-    # --- Build compact remap: old 0-based index -> new 0-based index ---
-    kept = sorted(used)
-    remap = {old: new for new, old in enumerate(kept)}
-    new_tile_count = len(kept)
 
-    # --- Remap GIDs in the layer data ---
-    new_gids: list[str] = []
+def _remap_gids(gids: list[int], remap: dict[int, int], firstgid: int) -> list[str]:
+    """Return a flat list of remapped GID strings (flip flags preserved).
+
+    Empty tiles (base index < 0) become ``"0"``.
+    """
+    result: list[str] = []
     for gid in gids:
         flags = gid & ~_TILED_GID_MASK
         base = (gid & _TILED_GID_MASK) - firstgid
-        if base < 0:
-            new_gids.append("0")
-        else:
-            new_gids.append(str(flags | (remap[base] + firstgid)))
+        result.append("0" if base < 0 else str(flags | (remap[base] + firstgid)))
+    return result
 
-    layer_el = tmx_root.find("layer")
-    if layer_el is None:
-        raise ValueError
-    map_width = int(layer_el.get("width", "0"))
+
+def _gids_to_csv(new_gids: list[str], map_width: int) -> str:
+    """Format a flat GID string list into a Tiled-style CSV block.
+
+    Each row ends with a comma except the last.  The block is wrapped
+    in leading and trailing newlines as Tiled expects.
+    """
     rows_out = len(new_gids) // map_width if map_width else 0
     csv_rows: list[str] = []
     for r in range(rows_out):
         row_gids = new_gids[r * map_width : (r + 1) * map_width]
         csv_rows.append(",".join(row_gids) + ("," if r < rows_out - 1 else ""))
-    csv_text = "\n" + "\n".join(csv_rows) + "\n"
+    return "\n" + "\n".join(csv_rows) + "\n"
 
-    # --- Save updated tileset image ---
+
+def _write_updated_tsx(
+    tsx_tree: ElementTree.ElementTree,
+    tsx_root_el: ElementTree.Element,
+    image_el: ElementTree.Element,
+    new_tile_count: int,
+    new_ts_cols: int,
+    new_ts_rows: int,
+    tsx_path: Path,
+) -> None:
+    """Update tileset dimensions in *tsx_root_el* and write *tsx_path*."""
+    tsx_root_el.set("tilecount", str(new_tile_count))
+    tsx_root_el.set("columns", str(new_ts_cols))
+    image_el.set("width", str(new_ts_cols * TILE_SIZE))
+    image_el.set("height", str(new_ts_rows * TILE_SIZE))
+    ElementTree.indent(tsx_root_el, space="  ")
+    tsx_tree.write(tsx_path, encoding="UTF-8", xml_declaration=True)
+    log.info("Updated TSX saved to %s", tsx_path)
+
+
+def _serialize_extra_layers(
+    tmx_root: ElementTree.Element,
+    tile_layer_el: ElementTree.Element,
+) -> list[str]:
+    """Serialize all TMX children except ``<tileset>`` and *tile_layer_el*.
+
+    CSV ``<layer>`` elements are re-formatted to canonical style;
+    ``<objectgroup>`` elements are serialized verbatim with two-space
+    indentation.  Returns a list of string lines for insertion into the
+    TMX output.
+    """
+    lines: list[str] = []
+    for child in tmx_root:
+        if child.tag == "tileset" or child is tile_layer_el:
+            continue
+        if child.tag == "layer":
+            _append_csv_layer(child, lines)
+        elif child.tag == "objectgroup":
+            ElementTree.indent(child, space="  ")
+            og_str = ElementTree.tostring(child, encoding="unicode")
+            lines.append("\n".join("  " + line for line in og_str.splitlines()))
+    return lines
+
+
+def _append_csv_layer(child: ElementTree.Element, lines: list[str]) -> None:
+    """Append a re-formatted CSV ``<layer>`` element to *lines*."""
+    data_sub = child.find("data")
+    if data_sub is None or data_sub.get("encoding") != "csv":
+        return
+    child_attrs = " ".join(f'{k}="{v}"' for k, v in child.attrib.items())
+    raw_rows = [
+        row.strip().rstrip(",")
+        for row in (data_sub.text or "").splitlines()
+        if row.strip()
+    ]
+    child_csv = (
+        "\n"
+        + "\n".join(
+            row + ("," if i < len(raw_rows) - 1 else "")
+            for i, row in enumerate(raw_rows)
+        )
+        + "\n"
+    )
+    lines.append(f"  <layer {child_attrs}>")
+    lines.append(f'    <data encoding="csv">{child_csv}    </data>')
+    lines.append("  </layer>")
+
+
+def clean_tmx(tmx_path: Path) -> None:
+    """Remove unused tiles from the tileset referenced by a TMX file.
+
+    Updates the tileset image, TSX, and TMX in-place.
+    """
+    tmx_dir = tmx_path.parent
+    tmx_root, gids, firstgid = parse_tmx_gids(tmx_path)
+
+    tileset_el = tmx_root.find("tileset")
+    if tileset_el is None:
+        msg = "No <tileset> element found after parsing."
+        raise ValueError(msg)
+    tsx_src = tileset_el.get("source", "")
+
+    tsx_tree, tsx_root_el, tsx_path, columns, tile_count, image_el, img_path = (
+        _load_tsx(tmx_dir, tileset_el)
+    )
+    log.info("TMX:      %s", tmx_path)
+    log.info("TSX:      %s", tsx_path)
+    log.info("Tileset:  %s  (%d tiles, %d columns)", img_path, tile_count, columns)
+
+    used = {b for gid in gids if (b := (gid & _TILED_GID_MASK) - firstgid) >= 0}
+    unused_count = tile_count - len(used)
+    if unused_count == 0:
+        log.info("No unused tiles found — nothing to do.")
+        return
+    log.info("Found %d unused tile(s) out of %d; removing...", unused_count, tile_count)
+
+    tiles, palette, src_mode = _slice_tileset_image(img_path)
+
+    kept = sorted(used)
+    remap = {old: new for new, old in enumerate(kept)}
+    new_tile_count = len(kept)
+
+    layer_el = tmx_root.find("layer")
+    if layer_el is None:
+        msg = "No <layer> element found after parsing."
+        raise ValueError(msg)
+    map_width = int(layer_el.get("width", "0"))
+    csv_text = _gids_to_csv(_remap_gids(gids, remap, firstgid), map_width)
+
     new_ts_cols = min(columns, new_tile_count)
     new_ts_rows = -(-new_tile_count // new_ts_cols)
-    mode = "P" if palette is not None else tileset_img.mode
+    mode = "P" if palette is not None else src_mode
     new_img = _new_image(
         mode,
         (new_ts_cols * TILE_SIZE, new_ts_rows * TILE_SIZE),
         palette,
     )
     for new_idx, old_idx in enumerate(kept):
-        tx = new_idx % new_ts_cols
-        ty = new_idx // new_ts_cols
+        tx, ty = new_idx % new_ts_cols, new_idx // new_ts_cols
         new_img.paste(tiles[old_idx], (tx * TILE_SIZE, ty * TILE_SIZE))
     _save_image(new_img, img_path, palette)
     log.info("Updated tileset image (%d tiles) saved to %s", new_tile_count, img_path)
 
-    # --- Update TSX ---
-    tsx_root_el.set("tilecount", str(new_tile_count))
-    tsx_root_el.set("columns", str(new_ts_cols))
-    image_el.set("width", str(new_ts_cols * TILE_SIZE))
-    image_el.set("height", str(new_ts_rows * TILE_SIZE))
-    ET.indent(tsx_root_el, space="  ")
-    tsx_tree.write(tsx_path, encoding="UTF-8", xml_declaration=True)
-    log.info("Updated TSX saved to %s", tsx_path)
+    _write_updated_tsx(
+        tsx_tree,
+        tsx_root_el,
+        image_el,
+        new_tile_count,
+        new_ts_cols,
+        new_ts_rows,
+        tsx_path,
+    )
 
-    # --- Save updated TMX (written as a string to preserve CSV integrity) ---
     map_attrs = " ".join(f'{k}="{v}"' for k, v in tmx_root.attrib.items())
     layer_attrs = " ".join(f'{k}="{v}"' for k, v in layer_el.attrib.items())
     tmx_lines = [
@@ -861,40 +1084,11 @@ def clean_tmx(tmx_path: Path) -> None:
         f"  <layer {layer_attrs}>",
         f'    <data encoding="csv">{csv_text}    </data>',
         "  </layer>",
+        *_serialize_extra_layers(tmx_root, layer_el),
+        "</map>",
     ]
-    # Re-serialize any additional layers/objectgroups after the tile layer.
-    for child in tmx_root:
-        if child.tag == "tileset" or (child.tag == "layer" and child is layer_el):
-            continue
-        if child.tag == "layer":
-            data_sub = child.find("data")
-            if data_sub is not None and data_sub.get("encoding") == "csv":
-                child_attrs = " ".join(f'{k}="{v}"' for k, v in child.attrib.items())
-                # Strip and re-format CSV to our canonical style.
-                raw_csv_rows = [
-                    row.strip().rstrip(",")
-                    for row in (data_sub.text or "").splitlines()
-                    if row.strip()
-                ]
-                child_csv = (
-                    "\n"
-                    + "\n".join(
-                        row + ("," if i < len(raw_csv_rows) - 1 else "")
-                        for i, row in enumerate(raw_csv_rows)
-                    )
-                    + "\n"
-                )
-                tmx_lines.append(f"  <layer {child_attrs}>")
-                tmx_lines.append(f'    <data encoding="csv">{child_csv}    </data>')
-                tmx_lines.append("  </layer>")
-        elif child.tag == "objectgroup":
-            ET.indent(child, space="  ")
-            og_str = ET.tostring(child, encoding="unicode")
-            tmx_lines.append("\n".join("  " + line for line in og_str.splitlines()))
-    tmx_lines.append("</map>")
     tmx_path.write_text("\n".join(tmx_lines), encoding="UTF-8")
     log.info("Updated TMX saved to %s", tmx_path)
-
     log.info("Done — removed %d unused tile(s).", unused_count)
 
 
@@ -903,7 +1097,8 @@ def clean_tmx(tmx_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """Build and return the CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="parse_tilemap.py",
         description=(
@@ -959,7 +1154,7 @@ def main() -> None:
     parser.add_argument(
         "--deduplicate",
         action="store_true",
-        help="Remove duplicate tiles (including flipped variants) from the tileset",
+        help="Remove duplicate tiles (including flipped variants)",
     )
     parser.add_argument(
         "--remove-unused",
@@ -972,159 +1167,174 @@ def main() -> None:
         action="store_true",
         help="Enable debug-level logging (includes 2-D array dump)",
     )
-    args = parser.parse_args()
+    return parser
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
 
-    # -----------------------------------------------------------------------
-    # Mode detection from file extensions
-    # -----------------------------------------------------------------------
-    files = args.files
-    if len(files) == 1 and files[0].lower().endswith(".tmx"):
-        # --- Clean mode ---
-        tmx_path = Path(files[0])
-        if not tmx_path.exists():
-            log.error("File '%s' not found.", tmx_path)
-            sys.exit(1)
-        clean_tmx(tmx_path)
-        return
+def _parse_stitch_mode(
+    files: list[str],
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> tuple[list[TileEntry], int, Path, Path]:
+    """Load and combine N .txt files for stitch mode.
 
-    if len(files) >= 3 and files[-1].lower().endswith(".png"):
-        # --- Stitch mode: map1.txt [map2.txt ...] tileset.png ---
-        txt_files = files[:-1]
-        png_arg = files[-1]
-        png_path = Path(png_arg)
-        if not png_path.exists():
-            log.error("PNG file '%s' not found.", png_path)
-            sys.exit(1)
-        all_values: list[list[int]] = []
-        for txt_file in txt_files:
-            try:
-                all_values.append(parse_hex_file(txt_file))
-            except FileNotFoundError:
-                log.error("File '%s' not found.", txt_file)
-                sys.exit(1)
-            except ValueError:
-                log.exception("Invalid hex value in '%s'.", txt_file)
-                sys.exit(1)
-        values = [v for part in all_values for v in part]
-        if len(values) % 2 != 0:
-            log.error(
-                "Combined data has an odd number of bytes (%d); cannot form complete 16-bit words.",
-                len(values),
-            )
-            sys.exit(1)
-        entries = parse_entries(values)
-        row_count = args.rows if args.rows is not None else 32
-        if len(entries) % row_count != 0:
-            parser.error(
-                f"Stitched entry count {len(entries)} is not divisible by {row_count} rows.",
-            )
-        cols = len(entries) // row_count
-        counts_str = " + ".join(str(len(v) // 2) for v in all_values)
-        log.info(
-            "Total tile entries after stitch: %d (%s) \u2192 %d columns \u00d7 %d rows.",
-            len(entries),
-            counts_str,
-            cols,
-            row_count,
+    Returns ``(entries, cols, stem_path, png_path)``.
+    """
+    txt_files, png_path = files[:-1], Path(files[-1])
+    if not png_path.exists():
+        log.exception("PNG file '%s' not found.", png_path)
+        sys.exit(1)
+    try:
+        all_values = [parse_hex_file(txt_file) for txt_file in txt_files]
+    except FileNotFoundError:
+        log.exception("Input file not found.")
+        sys.exit(1)
+    except ValueError:
+        log.exception("Invalid hex value in input file.")
+        sys.exit(1)
+    values = [v for part in all_values for v in part]
+    if len(values) % 2 != 0:
+        log.exception(
+            "Combined data has an odd number of bytes (%d); "
+            "cannot form complete 16-bit words.",
+            len(values),
         )
-        stems = [Path(f).stem for f in txt_files]
-        stem_path = Path(txt_files[0]).with_name("_".join(stems) + "_stitched")
-        filename = str(stem_path)
-    elif len(files) == 2 and files[1].lower().endswith(".png"):
-        # --- Pipeline mode: map.txt tileset.png ---
-        filename, png_arg = files[0], files[1]
-        png_path = Path(png_arg)
-        if not png_path.exists():
-            log.error("PNG file '%s' not found.", png_path)
-            sys.exit(1)
-        try:
-            values = parse_hex_file(filename)
-        except FileNotFoundError:
-            log.error("File '%s' not found.", filename)
-            sys.exit(1)
-        except ValueError:
-            log.exception("Invalid hex value in file.")
-            sys.exit(1)
-        if len(values) % 2 != 0:
-            log.error(
-                "File has an odd number of bytes (%d); cannot form complete 16-bit words.",
-                len(values),
-            )
-            sys.exit(1)
-        entries = parse_entries(values)
-        log.info("Total tile entries: %d", len(entries))
-        stem_path = Path(filename)
-    else:
+        sys.exit(1)
+    entries = parse_entries(values)
+    row_count = args.rows if args.rows is not None else 32
+    if len(entries) % row_count != 0:
         parser.error(
-            "expected one of:\n"
-            "  pipeline : <map.txt> <tileset.png>\n"
-            "  stitch   : <map1.txt> [map2.txt ...] <tileset.png>\n"
-            "  clean    : <map.tmx>",
+            f"Stitched entry count {len(entries)} is not "
+            f"divisible by {row_count} rows.",
         )
+    cols = len(entries) // row_count
+    counts_str = " + ".join(str(len(v) // 2) for v in all_values)
+    log.info(
+        "Total tile entries after stitch: %d (%s) \u2192 %d columns \u00d7 %d rows.",
+        len(entries),
+        counts_str,
+        cols,
+        row_count,
+    )
+    stems = [Path(f).stem for f in txt_files]
+    stem_path = Path(txt_files[0]).with_name("_".join(stems) + "_stitched")
+    return entries, cols, stem_path, png_path
 
-    # -----------------------------------------------------------------------
-    # Column / row resolution (pipeline mode only; stitch fixes cols=128)
-    # -----------------------------------------------------------------------
-    if len(files) == 2:
-        total = len(entries)
-        if args.columns is not None and args.rows is not None:
-            # Both explicitly provided: validate they account for all entries.
-            if args.columns <= 0:
-                parser.error("-c/--columns must be a positive integer")
-            if args.rows <= 0:
-                parser.error("-r/--rows must be a positive integer")
-            if args.columns * args.rows != total:
-                parser.error(
-                    f"-c {args.columns} \u00d7 -r {args.rows} = {args.columns * args.rows} "
-                    f"but file has {total} entries.",
-                )
-            cols = args.columns
-            log.info("Using %d columns \u00d7 %d rows.", cols, args.rows)
-        elif args.columns is not None:
-            # Explicit columns only: derive rows = total / cols.
-            if args.columns <= 0:
-                parser.error("-c/--columns must be a positive integer")
-            if total % args.columns != 0:
-                valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
-                parser.error(
-                    f"{total} entries cannot be evenly divided into {args.columns} columns "
-                    f"(remainder: {total % args.columns}). Valid column counts: {valid}",
-                )
-            cols = args.columns
-            log.info("Using %d columns.", cols)
-        else:
-            # Derive columns from --rows (default 32): screens are tiled horizontally.
-            row_count = args.rows if args.rows is not None else 32
-            if row_count <= 0:
-                parser.error("-r/--rows must be a positive integer")
-            if total % row_count != 0:
-                valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
-                parser.error(
-                    f"{total} entries cannot be evenly divided into {row_count} rows "
-                    f"(remainder: {total % row_count}). Valid row counts: {valid}",
-                )
-            cols = total // row_count
-            screens = cols // 32 if cols % 32 == 0 else cols
-            screen_info = (
-                f" ({screens} screen(s) of 32\u00d7{row_count})"
-                if cols % 32 == 0
-                else ""
-            )
-            log.info("Using %d columns \u00d7 %d rows%s.", cols, row_count, screen_info)
 
-    array_2d = build_array_2d(entries, cols)
-    log_array_2d(array_2d)
+def _parse_pipeline_mode(
+    files: list[str],
+) -> tuple[list[TileEntry], Path, Path]:
+    """Load a single .txt file for pipeline mode.
 
+    Returns ``(entries, stem_path, png_path)``.
+    """
+    filename, png_path = files[0], Path(files[1])
+    if not png_path.exists():
+        log.exception("PNG file '%s' not found.", png_path)
+        sys.exit(1)
+    try:
+        values = parse_hex_file(filename)
+    except FileNotFoundError:
+        log.exception("File '%s' not found.", filename)
+        sys.exit(1)
+    except ValueError:
+        log.exception("Invalid hex value in '%s'.", filename)
+        sys.exit(1)
+    if len(values) % 2 != 0:
+        log.exception(
+            "File has an odd number of bytes (%d); cannot form complete 16-bit words.",
+            len(values),
+        )
+        sys.exit(1)
+    entries = parse_entries(values)
+    log.info("Total tile entries: %d", len(entries))
+    return entries, Path(filename), png_path
+
+
+def _cols_from_both(
+    total: int,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Validate and return column count when both ``-c`` and ``-r`` are given."""
+    if args.columns <= 0:
+        parser.error("-c/--columns must be a positive integer")
+    if args.rows <= 0:
+        parser.error("-r/--rows must be a positive integer")
+    if args.columns * args.rows != total:
+        parser.error(
+            f"-c {args.columns} \u00d7 -r {args.rows} = {args.columns * args.rows} "
+            f"but file has {total} entries.",
+        )
+    log.info("Using %d columns \u00d7 %d rows.", args.columns, args.rows)
+    return args.columns
+
+
+def _cols_from_columns(
+    total: int,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Validate and return column count when only ``-c`` is given."""
+    if args.columns <= 0:
+        parser.error("-c/--columns must be a positive integer")
+    if total % args.columns != 0:
+        valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
+        parser.error(
+            f"{total} entries cannot be evenly divided into {args.columns} columns "
+            f"(remainder: {total % args.columns}). Valid column counts: {valid}",
+        )
+    log.info("Using %d columns.", args.columns)
+    return args.columns
+
+
+def _cols_from_rows(
+    total: int,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Derive column count from ``-r`` (default 32 rows)."""
+    row_count = args.rows if args.rows is not None else 32
+    if row_count <= 0:
+        parser.error("-r/--rows must be a positive integer")
+    if total % row_count != 0:
+        valid = ", ".join(str(c) for c in range(1, total + 1) if total % c == 0)
+        parser.error(
+            f"{total} entries cannot be evenly divided into {row_count} rows "
+            f"(remainder: {total % row_count}). Valid row counts: {valid}",
+        )
+    cols = total // row_count
+    screen_info = (
+        f" ({cols // 32} screen(s) of 32\u00d7{row_count})" if cols % 32 == 0 else ""
+    )
+    log.info("Using %d columns \u00d7 %d rows%s.", cols, row_count, screen_info)
+    return cols
+
+
+def _resolve_pipeline_cols(
+    entries: list[TileEntry],
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Choose the appropriate column-resolution strategy for pipeline mode."""
+    total = len(entries)
+    if args.columns is not None and args.rows is not None:
+        return _cols_from_both(total, args, parser)
+    if args.columns is not None:
+        return _cols_from_columns(total, args, parser)
+    return _cols_from_rows(total, args, parser)
+
+
+def _run_tilemap_pipeline(
+    array_2d: list[list[TileEntry]],
+    stem_path: Path,
+    png_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Load tiles, apply optional optimisations, then write all outputs."""
     if args.xml:
         save_xml(array_2d, stem_path.with_suffix(".xml"))
     if args.csv:
         save_csv(array_2d, stem_path)
-
     tiles, palette, color_count = load_tiles(png_path)
     if args.deduplicate:
         tiles = deduplicate_tiles(tiles, array_2d)
@@ -1138,11 +1348,56 @@ def main() -> None:
             stride=color_count,
         )
     validate_indices(array_2d, len(tiles))
-    tileset_out_path = stem_path.with_name(stem_path.stem + "_tileset.png")
-    save_tileset(tiles, tileset_out_path, palette)
+    save_tileset(tiles, stem_path.with_name(stem_path.stem + "_tileset.png"), palette)
     if args.render:
         render_image(array_2d, tiles, stem_path.with_suffix(".png"), palette)
     save_tiled(array_2d, len(tiles), stem_path)
+
+
+def main() -> None:
+    """CLI entry point — parse arguments and dispatch to the correct mode.
+
+    Determines the operating mode from the positional file arguments:
+
+    * **pipeline** — one ``.txt`` + one ``.png``: parse a single SNES
+      tilemap and produce TMX/TSX/tileset PNG.
+    * **stitch** — two-or-more ``.txt`` files + one ``.png``: concatenate
+      multiple SNES tilemaps side-by-side before running the pipeline.
+    * **clean** — single ``.tmx``: strip unused tiles from an existing
+      Tiled asset set in-place.
+    """
+    parser = _build_parser()
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    files = args.files
+    if len(files) == 1 and files[0].lower().endswith(".tmx"):
+        tmx_path = Path(files[0])
+        if not tmx_path.exists():
+            log.exception("File '%s' not found.", tmx_path)
+            sys.exit(1)
+        clean_tmx(tmx_path)
+        return
+
+    if len(files) >= 3 and files[-1].lower().endswith(".png"):
+        entries, cols, stem_path, png_path = _parse_stitch_mode(files, args, parser)
+    elif len(files) == 2 and files[1].lower().endswith(".png"):
+        entries, stem_path, png_path = _parse_pipeline_mode(files)
+        cols = _resolve_pipeline_cols(entries, args, parser)
+    else:
+        parser.error(
+            "expected one of:\n"
+            "  pipeline : <map.txt> <tileset.png>\n"
+            "  stitch   : <map1.txt> [map2.txt ...] <tileset.png>\n"
+            "  clean    : <map.tmx>",
+        )
+
+    array_2d = build_array_2d(entries, cols)
+    log_array_2d(array_2d)
+    _run_tilemap_pipeline(array_2d, stem_path, png_path, args)
 
 
 if __name__ == "__main__":
