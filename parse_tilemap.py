@@ -2,16 +2,16 @@
 
 Three operating modes, selected automatically from the arguments:
 
-  pipeline  parse a single SNES tilemap .txt file together with its
+  pipeline  parse a single SNES tilemap .vram file together with its
             tileset PNG and produce a Tiled TMX/TSX pair.
 
-            python parse_tilemap.py map.txt tileset.png
+            python parse_tilemap.py map.vram tileset.png
 
-  stitch    concatenate two or more SNES tilemap .txt files side-by-side
+  stitch    concatenate two or more SNES tilemap .vram files side-by-side
             to form a wider multi-screen map (128, 192, … columns), then
             run the same pipeline on the combined data.
 
-            python parse_tilemap.py map1.txt map2.txt tileset.png
+            python parse_tilemap.py map1.vram map2.vram tileset.png
 
   clean     remove unused tiles from an existing TMX/TSX/PNG triple
             in-place, compacting the tileset and remapping all GIDs.
@@ -39,8 +39,9 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
-from defusedxml import ElementTree
+from defusedxml.ElementTree import parse as safeparse
 from PIL import Image
 
 TILE_SIZE = 8
@@ -222,11 +223,11 @@ def save_xml(array_2d: list[list[TileEntry]], out_path: Path) -> None:
     """
     rows = len(array_2d)
     cols = len(array_2d[0]) if rows else 0
-    root = ElementTree.Element("tilemap", rows=str(rows), cols=str(cols))
+    root = ET.Element("tilemap", rows=str(rows), cols=str(cols))
     for r, row in enumerate(array_2d):
-        row_el = ElementTree.SubElement(root, "row", index=str(r))
+        row_el = ET.SubElement(root, "row", index=str(r))
         for e in row:
-            tile_el = ElementTree.SubElement(
+            tile_el = ET.SubElement(
                 row_el,
                 "tile",
                 hflip="1" if e.hflip else "0",
@@ -234,8 +235,8 @@ def save_xml(array_2d: list[list[TileEntry]], out_path: Path) -> None:
                 palette=str(e.palette),
             )
             tile_el.text = f"0x{e.index:02X}"
-    ElementTree.indent(root, space="  ")
-    ElementTree.ElementTree(root).write(
+    ET.indent(root, space="  ")
+    ET.ElementTree(root).write(
         out_path,
         encoding="utf-8",
         xml_declaration=True,
@@ -299,7 +300,7 @@ def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, i
     if tileset.mode == "P":
         pal_data = bytes(tileset.getpalette() or [])
         pal_transparency = tileset.info.get("transparency")
-        color_count: int = len(set(tileset.getdata()))
+        color_count: int = len(set(tileset.get_flattened_data()))
         palette: PaletteInfo | None = PaletteInfo(
             pal_data,
             pal_transparency,
@@ -318,7 +319,8 @@ def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, i
     else:
         tileset = tileset.convert("RGBA")
         palette = None
-        color_count = len(set(tileset.getdata()))
+        n_pixels = tileset.width * tileset.height
+        color_count = len(tileset.getcolors(maxcolors=n_pixels) or [])
         log.info("Tileset mode: %s", tileset.mode)
 
     ts_w, ts_h = tileset.size
@@ -524,6 +526,100 @@ _SNES_GRAYSCALE_16: bytes = bytes(
 ) + bytes(240 * 3)  # pad to 256 entries
 
 
+def parse_palettes_file(
+    path: Path,
+) -> list[list[tuple[int, int, int]]]:
+    """Parse a ``.plt`` palette file into a list of RGB palette entries.
+
+    Expected format (repeated for each palette)::
+
+        -- Palette 0 --
+        #RRGGBB
+        #RRGGBB
+        ...
+
+    Each block is introduced by a ``-- Palette N --`` header line.  Colors
+    within a block are listed one per line as ``#RRGGBB`` hex strings.
+    Returns a list of palettes; each palette is a list of ``(r, g, b)``
+    tuples.
+    """
+    palettes: list[list[tuple[int, int, int]]] = []
+    current: list[tuple[int, int, int]] = []
+    with path.open(encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("--"):
+                if current:
+                    palettes.append(current)
+                current = []
+            elif line.startswith("#") and len(line) == 7:
+                r = int(line[1:3], 16)
+                g = int(line[3:5], 16)
+                b = int(line[5:7], 16)
+                current.append((r, g, b))
+    if current:
+        palettes.append(current)
+    log.debug("Loaded %d palette(s) from '%s'", len(palettes), path)
+    return palettes
+
+
+def apply_direct_palettes(
+    tiles: list[Image.Image],
+    array_2d: list[list[TileEntry]],
+    rgb_palettes: list[list[tuple[int, int, int]]],
+) -> list[Image.Image]:
+    """Create per-(tile, palette) RGBA variants using real RGB color data.
+
+    For each unique ``(tile_index, palette_id)`` pair referenced in *array_2d*,
+    a copy of the tile is colorized with ``rgb_palettes[palette_id]`` and
+    converted to RGBA.  *array_2d* is updated in-place.  Returns the expanded
+    RGBA tile list.
+
+    This is the correct path for 4bpp tilesets (16 colors per tile) where
+    each palette block in the file supplies a complete 16-color sub-palette.
+    ``palette_id`` is computed as ``e.palette % len(rgb_palettes)`` so both
+    0-based and SNES-style (8-offset) raw palette indices are handled safely.
+    """
+    num_pal = len(rgb_palettes)
+    used_pairs: set[tuple[int, int]] = {
+        (e.index, e.palette % num_pal) for row in array_2d for e in row
+    }
+    sorted_pairs = sorted(used_pairs)
+    variant_map: dict[tuple[int, int], int] = {
+        pair: new_idx for new_idx, pair in enumerate(sorted_pairs)
+    }
+
+    new_tiles: list[Image.Image] = []
+    for old_idx, pal_id in sorted_pairs:
+        t = tiles[old_idx].copy()
+        pal_colors = rgb_palettes[pal_id]
+        flat = bytearray(256 * 3)
+        for i, (r, g, b) in enumerate(pal_colors):
+            flat[i * 3] = r
+            flat[i * 3 + 1] = g
+            flat[i * 3 + 2] = b
+        if t.mode == "P":
+            t.putpalette(bytes(flat))
+        new_tiles.append(t.convert("RGBA"))
+
+    for row in array_2d:
+        for e in row:
+            pal_id = e.palette % num_pal
+            e.index = variant_map[(e.index, pal_id)]
+            e.palette = pal_id
+
+    log.info(
+        "Direct palette colorization: %d variant(s) from %d tile(s) "
+        "across %d palette(s)",
+        len(new_tiles),
+        len(tiles),
+        num_pal,
+    )
+    return new_tiles
+
+
 def apply_palette_offsets(
     tiles: list[Image.Image],
     array_2d: list[list[TileEntry]],
@@ -534,8 +630,8 @@ def apply_palette_offsets(
 
     For a tileset with *stride* colors per sub-palette, each tile used with
     palette group P has its pixel indices shifted by ``P * stride`` so that
-    they land in the correct slot of the canonical 16-color grayscale table
-    (_SNES_GRAYSCALE_16).  SNES palette indices are compacted to a dense
+    they land in the correct slot of the built-in grayscale stand-in
+    ``_SNES_GRAYSCALE_16``.  SNES palette indices are compacted to a dense
     0, 1, 2, … range so that only the groups actually referenced contribute
     to the color count.  Tiles used with multiple palette groups are
     duplicated.
@@ -556,8 +652,10 @@ def apply_palette_offsets(
         pair: new_idx for new_idx, pair in enumerate(sorted_cg_pairs)
     }
 
+    pixel_palette: bytes = _SNES_GRAYSCALE_16
+
     # Build one tile variant per (tile_index, CG) with pixel indices offset
-    # by CG * stride so they point into the correct slot of _SNES_GRAYSCALE_16.
+    # by CG * stride so they point into the correct slot of the color table.
     new_tiles: list[Image.Image] = []
     for old_idx, cg in sorted_cg_pairs:
         offset = cg * stride
@@ -567,7 +665,7 @@ def apply_palette_offsets(
             raw = tiles[old_idx].tobytes()
             remapped = bytes(0 if px == 0 else px + offset for px in raw)
             t = Image.frombytes("P", tiles[old_idx].size, remapped)
-        t.putpalette(_SNES_GRAYSCALE_16)
+        t.putpalette(pixel_palette)
         new_tiles.append(t)
 
     # Update array_2d: tile index → variant, e.palette → PI = snes_pal // stride.
@@ -634,13 +732,18 @@ def save_tileset(
     out_path: Path,
     palette: PaletteInfo | None,
     tiles_per_row: int = 16,
+    *,
+    quantize: bool = True,
 ) -> None:
     """Pack *tiles* into a grid PNG and save it to *out_path*.
 
     Tiles are arranged left-to-right, top-to-bottom with up to
     *tiles_per_row* columns.  The image mode and bit depth are derived
     from *palette*: ``'P'`` (indexed) when a palette is provided,
-    ``'RGBA'`` otherwise.  Transparency and bit-depth hints from
+    ``'RGBA'`` otherwise.  When *quantize* is ``True`` and the assembled
+    image is RGBA, it is converted to an optimized indexed PNG using
+    Pillow's fast-octree quantizer before saving; pass ``quantize=False``
+    to keep the raw RGBA output.  Transparency and bit-depth hints from
     *palette* are forwarded to the PNG encoder via ``_save_image``.
     """
     mode = "P" if palette is not None else "RGBA"
@@ -651,14 +754,25 @@ def save_tileset(
         tx = idx % cols
         ty = idx // cols
         img.paste(tile, (tx * TILE_SIZE, ty * TILE_SIZE))
-    _save_image(img, out_path, palette)
-    log.info(
-        "Tileset image (%d tiles, %dx%d px) saved to %s",
-        len(tiles),
-        cols * TILE_SIZE,
-        rows * TILE_SIZE,
-        out_path,
-    )
+    if quantize and mode == "RGBA":
+        img = img.quantize(colors=256, method=Image.Quantize.FASTOCTREE)
+        img.save(out_path)
+        log.info(
+            "Tileset image (%d tiles, %dx%d px) saved as indexed PNG to %s",
+            len(tiles),
+            cols * TILE_SIZE,
+            rows * TILE_SIZE,
+            out_path,
+        )
+    else:
+        _save_image(img, out_path, palette)
+        log.info(
+            "Tileset image (%d tiles, %dx%d px) saved to %s",
+            len(tiles),
+            cols * TILE_SIZE,
+            rows * TILE_SIZE,
+            out_path,
+        )
 
 
 def render_image(
@@ -713,7 +827,8 @@ def save_tiled(
     """Write a Tiled-compatible TSX tileset and TMX tilemap.
 
     GIDs are 1-based (0 = empty).  Flip flags are OR-ed into the high bits
-    of each GID as Tiled expects.
+    of each GID as Tiled expects.  A single "Tiles" layer is written; no
+    separate Palette layer is included.
     """
     rows = len(array_2d)
     cols = len(array_2d[0]) if rows else 0
@@ -726,7 +841,7 @@ def save_tiled(
     tmx_path = stem_path.with_suffix(".tmx")
 
     # --- TSX ---
-    tsx_root = ElementTree.Element(
+    tsx_root = ET.Element(
         "tileset",
         version="1.10",
         name=name,
@@ -735,15 +850,15 @@ def save_tiled(
         tilecount=str(tile_count),
         columns=str(ts_cols),
     )
-    ElementTree.SubElement(
+    ET.SubElement(
         tsx_root,
         "image",
         source=tileset_png_name,
         width=str(ts_cols * TILE_SIZE),
         height=str(ts_rows * TILE_SIZE),
     )
-    ElementTree.indent(tsx_root, space="  ")
-    ElementTree.ElementTree(tsx_root).write(
+    ET.indent(tsx_root, space="  ")
+    ET.ElementTree(tsx_root).write(
         tsx_path,
         encoding="UTF-8",
         xml_declaration=True,
@@ -767,27 +882,17 @@ def save_tiled(
 
     csv_data = "\n" + "\n".join(csv_rows) + "\n"
 
-    # --- Palette CSV layer ---
-    pal_rows: list[str] = []
-    for r, row in enumerate(array_2d):
-        pal_values = [str(e.palette) for e in row]
-        pal_rows.append(",".join(pal_values) + ("," if r < rows - 1 else ""))
-    pal_data = "\n" + "\n".join(pal_rows) + "\n"
-
-    # Write TMX directly as a string to avoid ElementTree.indent corrupting the CSV.
+    # Write TMX directly as a string to avoid ET.indent corrupting the CSV.
     tmx_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<map version="1.10" tiledversion="1.10.2" orientation="orthogonal"'
         f' renderorder="right-down"'
         f' width="{cols}" height="{rows}"'
         f' tilewidth="{TILE_SIZE}" tileheight="{TILE_SIZE}"'
-        f' infinite="0" nextlayerid="3" nextobjectid="1">',
+        f' infinite="0" nextlayerid="2" nextobjectid="1">',
         f'  <tileset firstgid="1" source="{tsx_path.name}"/>',
         f'  <layer id="1" name="Tiles" width="{cols}" height="{rows}">',
         f'    <data encoding="csv">{csv_data}    </data>',
-        "  </layer>",
-        f'  <layer id="2" name="Palette" width="{cols}" height="{rows}">',
-        f'    <data encoding="csv">{pal_data}    </data>',
         "  </layer>",
         "</map>",
     ]
@@ -804,7 +909,7 @@ _TILED_GID_MASK: int = 0x1FFFFFFF
 # ---------------------------------------------------------------------------
 
 
-def parse_tmx_gids(tmx_path: Path) -> tuple[ElementTree.Element, list[int], int]:
+def parse_tmx_gids(tmx_path: Path) -> tuple[ET.Element, list[int], int]:
     """Parse *tmx_path* and extract the tile-layer GID list.
 
     Reads the first ``<tileset>`` and ``<layer>`` elements; the layer
@@ -820,7 +925,7 @@ def parse_tmx_gids(tmx_path: Path) -> tuple[ElementTree.Element, list[int], int]
         * ``firstgid``  — the ``firstgid`` attribute of the tileset element.
 
     """
-    tree = ElementTree.parse(tmx_path)
+    tree = safeparse(tmx_path)
     root = tree.getroot()
 
     tileset_el = root.find("tileset")
@@ -845,14 +950,14 @@ def parse_tmx_gids(tmx_path: Path) -> tuple[ElementTree.Element, list[int], int]
 
 def _load_tsx(
     tmx_dir: Path,
-    tileset_el: ElementTree.Element,
+    tileset_el: ET.Element,
 ) -> tuple[
-    ElementTree.ElementTree,
-    ElementTree.Element,
+    ET.ElementTree,
+    ET.Element,
     Path,
     int,
     int,
-    ElementTree.Element,
+    ET.Element,
     Path,
 ]:
     """Load and validate the TSX file referenced by *tileset_el*.
@@ -866,7 +971,7 @@ def _load_tsx(
         log.exception("TSX file '%s' not found.", tsx_path)
         sys.exit(1)
 
-    tsx_tree = ElementTree.parse(tsx_path)
+    tsx_tree = safeparse(tsx_path)
     tsx_root_el = tsx_tree.getroot()
     columns = int(tsx_root_el.get("columns", "16"))
     tile_count = int(tsx_root_el.get("tilecount", "0"))
@@ -944,9 +1049,9 @@ def _gids_to_csv(new_gids: list[str], map_width: int) -> str:
 
 
 def _write_updated_tsx(
-    tsx_tree: ElementTree.ElementTree,
-    tsx_root_el: ElementTree.Element,
-    image_el: ElementTree.Element,
+    tsx_tree: ET.ElementTree,
+    tsx_root_el: ET.Element,
+    image_el: ET.Element,
     new_tile_count: int,
     new_ts_cols: int,
     new_ts_rows: int,
@@ -957,14 +1062,14 @@ def _write_updated_tsx(
     tsx_root_el.set("columns", str(new_ts_cols))
     image_el.set("width", str(new_ts_cols * TILE_SIZE))
     image_el.set("height", str(new_ts_rows * TILE_SIZE))
-    ElementTree.indent(tsx_root_el, space="  ")
+    ET.indent(tsx_root_el, space="  ")
     tsx_tree.write(tsx_path, encoding="UTF-8", xml_declaration=True)
     log.info("Updated TSX saved to %s", tsx_path)
 
 
 def _serialize_extra_layers(
-    tmx_root: ElementTree.Element,
-    tile_layer_el: ElementTree.Element,
+    tmx_root: ET.Element,
+    tile_layer_el: ET.Element,
 ) -> list[str]:
     """Serialize all TMX children except ``<tileset>`` and *tile_layer_el*.
 
@@ -980,13 +1085,13 @@ def _serialize_extra_layers(
         if child.tag == "layer":
             _append_csv_layer(child, lines)
         elif child.tag == "objectgroup":
-            ElementTree.indent(child, space="  ")
-            og_str = ElementTree.tostring(child, encoding="unicode")
+            ET.indent(child, space="  ")
+            og_str = ET.tostring(child, encoding="unicode")
             lines.append("\n".join("  " + line for line in og_str.splitlines()))
     return lines
 
 
-def _append_csv_layer(child: ElementTree.Element, lines: list[str]) -> None:
+def _append_csv_layer(child: ET.Element, lines: list[str]) -> None:
     """Append a re-formatted CSV ``<layer>`` element to *lines*."""
     data_sub = child.find("data")
     if data_sub is None or data_sub.get("encoding") != "csv":
@@ -1104,8 +1209,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Parse an SNES tilemap hex file or clean an existing TMX.\n\n"
             "Modes:\n"
-            "  pipeline : parse_tilemap.py map.txt tileset.png\n"
-            "  stitch   : parse_tilemap.py map1.txt [map2.txt ...] tileset.png\n"
+            "  pipeline : parse_tilemap.py map.vram tileset.png\n"
+            "  stitch   : parse_tilemap.py map1.vram [map2.vram ...] tileset.png\n"
             "  clean    : parse_tilemap.py map.tmx"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1115,8 +1220,8 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="FILE",
         help=(
-            "pipeline: <map.txt> <tileset.png>  |  "
-            "stitch: <map1.txt> [map2.txt ...] <tileset.png>  |  "
+            "pipeline: <map.vram> <tileset.png>  |  "
+            "stitch: <map1.vram> [map2.vram ...] <tileset.png>  |  "
             "clean: <map.tmx>"
         ),
     )
@@ -1162,6 +1267,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Remove tiles not referenced by any map cell",
     )
     parser.add_argument(
+        "--rawpng",
+        action="store_true",
+        help=(
+            "Save the tileset PNG as raw RGBA instead of the default "
+            "optimized indexed PNG.  Useful when downstream tools require "
+            "a full 32-bit image."
+        ),
+    )
+    parser.add_argument(
+        "--palettes",
+        metavar="FILE",
+        default=None,
+        help=(
+            "Path to a .plt palette file containing real RGB colors.  "
+            "Each block starts with '-- Palette N --' and lists 16 '#RRGGBB' "
+            "lines.  When supplied, tiles are colorized with these values "
+            "instead of the built-in grayscale stand-in."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -1175,16 +1300,16 @@ def _parse_stitch_mode(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
 ) -> tuple[list[TileEntry], int, Path, Path]:
-    """Load and combine N .txt files for stitch mode.
+    """Load and combine N .vram files for stitch mode.
 
     Returns ``(entries, cols, stem_path, png_path)``.
     """
-    txt_files, png_path = files[:-1], Path(files[-1])
+    vram_files, png_path = files[:-1], Path(files[-1])
     if not png_path.exists():
         log.exception("PNG file '%s' not found.", png_path)
         sys.exit(1)
     try:
-        all_values = [parse_hex_file(txt_file) for txt_file in txt_files]
+        all_values = [parse_hex_file(vram_file) for vram_file in vram_files]
     except FileNotFoundError:
         log.exception("Input file not found.")
         sys.exit(1)
@@ -1215,15 +1340,14 @@ def _parse_stitch_mode(
         cols,
         row_count,
     )
-    stems = [Path(f).stem for f in txt_files]
-    stem_path = Path(txt_files[0]).with_name("_".join(stems) + "_stitched")
+    stem_path = Path(vram_files[0]).with_suffix("")
     return entries, cols, stem_path, png_path
 
 
 def _parse_pipeline_mode(
     files: list[str],
 ) -> tuple[list[TileEntry], Path, Path]:
-    """Load a single .txt file for pipeline mode.
+    """Load a single .vram file for pipeline mode.
 
     Returns ``(entries, stem_path, png_path)``.
     """
@@ -1330,7 +1454,11 @@ def _run_tilemap_pipeline(
     png_path: Path,
     args: argparse.Namespace,
 ) -> None:
-    """Load tiles, apply optional optimisations, then write all outputs."""
+    """Load tiles, apply optional optimisations, then write all outputs.
+
+    All tiles are converted to RGBA before saving so the tileset PNG is a
+    standard 8-bit-per-channel image with no palette chunk.
+    """
     if args.xml:
         save_xml(array_2d, stem_path.with_suffix(".xml"))
     if args.csv:
@@ -1340,15 +1468,31 @@ def _run_tilemap_pipeline(
         tiles = deduplicate_tiles(tiles, array_2d)
     if args.remove_unused:
         tiles = remove_unused_tiles(tiles, array_2d)
-    if palette is not None and color_count == 4:
-        tiles, palette, color_count = apply_palette_offsets(
-            tiles,
-            array_2d,
-            palette,
-            stride=color_count,
-        )
+    rgb_palettes: list[list[tuple[int, int, int]]] | None = None
+    if args.palettes is not None:
+        rgb_palettes = parse_palettes_file(Path(args.palettes))
+    if rgb_palettes is not None and palette is not None:
+        # 4bpp path: colorize each (tile, palette) variant directly with real
+        # RGB data.  apply_direct_palettes returns RGBA tiles immediately.
+        tiles = apply_direct_palettes(tiles, array_2d, rgb_palettes)
+    else:
+        if palette is not None and color_count == 4:
+            tiles, palette, color_count = apply_palette_offsets(
+                tiles,
+                array_2d,
+                palette,
+                stride=color_count,
+            )
+        # Convert any remaining indexed tiles to RGBA.
+        tiles = [t.convert("RGBA") if t.mode == "P" else t for t in tiles]
+    palette = None
     validate_indices(array_2d, len(tiles))
-    save_tileset(tiles, stem_path.with_name(stem_path.stem + "_tileset.png"), palette)
+    save_tileset(
+        tiles,
+        stem_path.with_name(stem_path.stem + "_tileset.png"),
+        palette,
+        quantize=not args.rawpng,
+    )
     if args.render:
         render_image(array_2d, tiles, stem_path.with_suffix(".png"), palette)
     save_tiled(array_2d, len(tiles), stem_path)
@@ -1359,9 +1503,9 @@ def main() -> None:
 
     Determines the operating mode from the positional file arguments:
 
-    * **pipeline** — one ``.txt`` + one ``.png``: parse a single SNES
+    * **pipeline** — one ``.vram`` + one ``.png``: parse a single SNES
       tilemap and produce TMX/TSX/tileset PNG.
-    * **stitch** — two-or-more ``.txt`` files + one ``.png``: concatenate
+    * **stitch** — two-or-more ``.vram`` files + one ``.png``: concatenate
       multiple SNES tilemaps side-by-side before running the pipeline.
     * **clean** — single ``.tmx``: strip unused tiles from an existing
       Tiled asset set in-place.
@@ -1390,8 +1534,8 @@ def main() -> None:
     else:
         parser.error(
             "expected one of:\n"
-            "  pipeline : <map.txt> <tileset.png>\n"
-            "  stitch   : <map1.txt> [map2.txt ...] <tileset.png>\n"
+            "  pipeline : <map.vram> <tileset.png>\n"
+            "  stitch   : <map1.vram> [map2.vram ...] <tileset.png>\n"
             "  clean    : <map.tmx>",
         )
 
