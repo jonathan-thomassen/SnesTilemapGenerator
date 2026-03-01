@@ -62,9 +62,9 @@ class TileEntry:
         index:   Zero-based tile index within the tileset image.
         hflip:   Horizontal flip flag.
         vflip:   Vertical flip flag.
-        palette: SNES palette index (0-15 raw; re-interpreted as a
-                 palette-index / color-group pair by
-                 ``apply_palette_offsets``).
+        palette: SNES palette index (0-15 raw; decomposed into a
+                 main-palette index and color-group by
+                 ``apply_direct_palettes``).
 
     """
 
@@ -286,39 +286,30 @@ def save_csv(array_2d: list[list[TileEntry]], stem_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, int]:
+def load_tiles(png_path: Path) -> tuple[list[Image.Image], int]:
     """Slice a tileset PNG into TILE_SIZExTILE_SIZE images.
 
-    If the source image is in Indexed Color Mode ("P"), the palette and any
-    transparency index are preserved in a PaletteInfo so output images can be
-    saved in the same mode with full transparency retained.  For all other
-    modes the image is converted to RGBA.
-    Returns (tiles, palette, color_count) where palette is None for non-indexed
-    images and color_count is the number of distinct colors used in the source PNG.
+    The source image must be in Indexed Color Mode (``'P'``); ``apply_direct_palettes``
+    requires pixel-index tiles to apply real RGB color data from a ``.plt`` file.
+    Returns ``(tiles, color_count)`` where *color_count* is the number of distinct
+    palette entries used (4 for 2bpp, 16 for 4bpp).
     """
     tileset = Image.open(png_path)
     if tileset.mode == "P":
-        pal_data = bytes(tileset.getpalette() or [])
-        pal_transparency = tileset.info.get("transparency")
         color_count: int = len(set(tileset.get_flattened_data()))
-        palette: PaletteInfo | None = PaletteInfo(
-            pal_data,
-            pal_transparency,
-            color_count,
-        )
+        pal_transparency = tileset.info.get("transparency")
         trans_note = (
             f", transparency index {pal_transparency}"
             if pal_transparency is not None
             else ""
         )
         log.info(
-            "Tileset mode: Indexed Color (P) — palette preserved%s, %d colors",
+            "Tileset mode: Indexed Color (P)%s, %d colors",
             trans_note,
             color_count,
         )
     else:
         tileset = tileset.convert("RGBA")
-        palette = None
         n_pixels = tileset.width * tileset.height
         color_count = len(tileset.getcolors(maxcolors=n_pixels) or [])
         log.info("Tileset mode: %s", tileset.mode)
@@ -349,7 +340,7 @@ def load_tiles(png_path: Path) -> tuple[list[Image.Image], PaletteInfo | None, i
         for tx in range(tiles_per_row):
             x0, y0 = tx * TILE_SIZE, ty * TILE_SIZE
             tiles.append(tileset.crop((x0, y0, x0 + TILE_SIZE, y0 + TILE_SIZE)))
-    return tiles, palette, color_count
+    return tiles, color_count
 
 
 def deduplicate_tiles(
@@ -469,63 +460,6 @@ def remove_unused_tiles(
     return [tiles[i] for i in kept]
 
 
-# 16-color canonical sub-palette table for 4-color SNES tilesets.
-# Sub-palette P occupies indices P*4 … P*4+3.
-# Stored as 256-entry RGB flat bytes (768 bytes) as Pillow requires.
-_SNES_GRAYSCALE_16: bytes = bytes(
-    [
-        0x00,
-        0x00,
-        0x00,  # 0  - group 0
-        0x30,
-        0x30,
-        0x30,  # 1
-        0x40,
-        0x40,
-        0x40,  # 2
-        0x50,
-        0x50,
-        0x50,  # 3
-        0x60,
-        0x60,
-        0x60,  # 4  - group 1
-        0x70,
-        0x70,
-        0x70,  # 5
-        0x80,
-        0x80,
-        0x80,  # 6
-        0x90,
-        0x90,
-        0x90,  # 7
-        0x98,
-        0x98,
-        0x98,  # 8  - group 2
-        0xA0,
-        0xA0,
-        0xA0,  # 9
-        0xAA,
-        0xAA,
-        0xAA,  # 10
-        0xBB,
-        0xBB,
-        0xBB,  # 11
-        0xCC,
-        0xCC,
-        0xCC,  # 12 - group 3
-        0xDD,
-        0xDD,
-        0xDD,  # 13
-        0xEE,
-        0xEE,
-        0xEE,  # 14
-        0xFF,
-        0xFF,
-        0xFF,  # 15
-    ],
-) + bytes(240 * 3)  # pad to 256 entries
-
-
 def parse_palettes_file(
     path: Path,
 ) -> list[list[tuple[int, int, int]]]:
@@ -603,9 +537,9 @@ def apply_direct_palettes(
     for old_idx, raw_pal in sorted_pairs:
         t = tiles[old_idx].copy()
         if stride is not None:
-            PI = raw_pal // stride - 2
-            CG = raw_pal % stride
-            pal_colors = rgb_palettes[PI % num_pal][CG * stride : (CG + 1) * stride]
+            pi = raw_pal // stride - 2
+            cg = raw_pal % stride
+            pal_colors = rgb_palettes[pi % num_pal][cg * stride : (cg + 1) * stride]
         else:
             pal_colors = rgb_palettes[raw_pal % num_pal]
         flat = bytearray(256 * 3)
@@ -665,82 +599,6 @@ def apply_direct_palettes(
     return new_tiles
 
 
-def apply_palette_offsets(
-    tiles: list[Image.Image],
-    array_2d: list[list[TileEntry]],
-    palette: PaletteInfo,
-    stride: int = 4,
-) -> tuple[list[Image.Image], PaletteInfo, int]:
-    """Create per-(tile, palette-group) variants with remapped pixel indices.
-
-    For a tileset with *stride* colors per sub-palette, each tile used with
-    palette group P has its pixel indices shifted by ``P * stride`` so that
-    they land in the correct slot of the built-in grayscale stand-in
-    ``_SNES_GRAYSCALE_16``.  SNES palette indices are compacted to a dense
-    0, 1, 2, … range so that only the groups actually referenced contribute
-    to the color count.  Tiles used with multiple palette groups are
-    duplicated.
-
-    *array_2d* is updated in-place.  Returns the expanded tile list, a new
-    PaletteInfo built from the canonical table, and the total color slot count.
-    """
-    # Decompose each SNES palette into:
-    #   PI  (palette index, output to TMX) = snes_pal // stride
-    #   CG  (color group, drives pixel offset) = snes_pal % stride
-    # Tiles with the same (tile_index, CG) are visually identical regardless
-    # of PI, so we deduplicate on (tile_index, CG).
-    used_cg_pairs: set[tuple[int, int]] = {
-        (e.index, e.palette % stride) for row in array_2d for e in row
-    }
-    sorted_cg_pairs = sorted(used_cg_pairs)
-    variant_map: dict[tuple[int, int], int] = {
-        pair: new_idx for new_idx, pair in enumerate(sorted_cg_pairs)
-    }
-
-    pixel_palette: bytes = _SNES_GRAYSCALE_16
-
-    # Build one tile variant per (tile_index, CG) with pixel indices offset
-    # by CG * stride so they point into the correct slot of the color table.
-    new_tiles: list[Image.Image] = []
-    for old_idx, cg in sorted_cg_pairs:
-        offset = cg * stride
-        if offset == 0:
-            t = tiles[old_idx].copy()
-        else:
-            raw = tiles[old_idx].tobytes()
-            remapped = bytes(0 if px == 0 else px + offset for px in raw)
-            t = Image.frombytes("P", tiles[old_idx].size, remapped)
-        t.putpalette(pixel_palette)
-        new_tiles.append(t)
-
-    # Update array_2d: tile index → variant, e.palette → PI = snes_pal // stride.
-    for row in array_2d:
-        for e in row:
-            cg = e.palette % stride
-            e.index = variant_map[(e.index, cg)]
-            e.palette = e.palette // stride - 2
-
-    num_groups = len(sorted_cg_pairs)
-
-    total_slots = num_groups * stride
-    log.info(
-        "Palette expansion (stride=%d): %d variant(s) from %d unique tile(s) "
-        "across %d sub-palette(s) \u2192 %d color slots",
-        stride,
-        len(new_tiles),
-        len(tiles),
-        num_groups,
-        total_slots,
-    )
-
-    canonical_palette = PaletteInfo(
-        data=_SNES_GRAYSCALE_16,
-        transparency=palette.transparency,
-        num_colors=16,
-    )
-    return new_tiles, canonical_palette, total_slots
-
-
 def _new_image(
     mode: str,
     size: tuple[int, int],
@@ -775,31 +633,25 @@ def _save_image(img: Image.Image, out_path: Path, palette: PaletteInfo | None) -
 def save_tileset(
     tiles: list[Image.Image],
     out_path: Path,
-    palette: PaletteInfo | None,
     tiles_per_row: int = 16,
     *,
-    quantize: bool = True,
+    quantize: bool = False,
 ) -> None:
-    """Pack *tiles* into a grid PNG and save it to *out_path*.
+    """Pack *tiles* into a grid RGBA PNG and save it to *out_path*.
 
     Tiles are arranged left-to-right, top-to-bottom with up to
-    *tiles_per_row* columns.  The image mode and bit depth are derived
-    from *palette*: ``'P'`` (indexed) when a palette is provided,
-    ``'RGBA'`` otherwise.  When *quantize* is ``True`` and the assembled
-    image is RGBA, it is converted to an optimized indexed PNG using
-    Pillow's fast-octree quantizer before saving; pass ``quantize=False``
-    to keep the raw RGBA output.  Transparency and bit-depth hints from
-    *palette* are forwarded to the PNG encoder via ``_save_image``.
+    *tiles_per_row* columns.  When *quantize* is ``True`` the assembled
+    RGBA image is converted to an optimized indexed PNG using Pillow's
+    fast-octree quantizer before saving.
     """
-    mode = "P" if palette is not None else "RGBA"
     cols = min(tiles_per_row, len(tiles))
     rows = -(-len(tiles) // cols)  # ceiling division
-    img = _new_image(mode, (cols * TILE_SIZE, rows * TILE_SIZE), palette)
+    img = Image.new("RGBA", (cols * TILE_SIZE, rows * TILE_SIZE))
     for idx, tile in enumerate(tiles):
         tx = idx % cols
         ty = idx // cols
         img.paste(tile, (tx * TILE_SIZE, ty * TILE_SIZE))
-    if quantize and mode == "RGBA":
+    if quantize:
         n_colors = len(img.getcolors(maxcolors=img.width * img.height) or [])
         n_colors = max(1, n_colors)
         img = img.quantize(colors=n_colors, method=Image.Quantize.FASTOCTREE)
@@ -816,7 +668,7 @@ def save_tileset(
             out_path,
         )
     else:
-        _save_image(img, out_path, palette)
+        img.save(out_path)
         log.info(
             "Tileset image (%d tiles, %dx%d px) saved to %s",
             len(tiles),
@@ -830,19 +682,15 @@ def render_image(
     array_2d: list[list[TileEntry]],
     tiles: list[Image.Image],
     out_path: Path,
-    palette: PaletteInfo | None,
 ) -> None:
-    """Compose the full tilemap into a single PNG and save it to *out_path*.
+    """Compose the full tilemap into a single RGBA PNG and save it to *out_path*.
 
     Each cell in *array_2d* is looked up in *tiles* and pasted at the
-    correct pixel position, with flip transforms applied.  The output
-    image uses mode ``'P'`` when *palette* is provided, otherwise
-    ``'RGBA'``.
+    correct pixel position, with flip transforms applied.
     """
-    mode = "P" if palette is not None else "RGBA"
     rows = len(array_2d)
     cols = len(array_2d[0]) if rows else 0
-    out_img = _new_image(mode, (cols * TILE_SIZE, rows * TILE_SIZE), palette)
+    out_img = Image.new("RGBA", (cols * TILE_SIZE, rows * TILE_SIZE))
     for r, row in enumerate(array_2d):
         for c, e in enumerate(row):
             tile = tiles[e.index]
@@ -851,7 +699,7 @@ def render_image(
             if e.vflip:
                 tile = tile.transpose(Image.FLIP_TOP_BOTTOM)
             out_img.paste(tile, (c * TILE_SIZE, r * TILE_SIZE))
-    _save_image(out_img, out_path, palette)
+    out_img.save(out_path)
     log.info(
         "Output image (%dx%d px) saved to %s",
         cols * TILE_SIZE,
@@ -1287,7 +1135,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Parse one or more SNES tilemap .vram files or clean an existing TMX.\n\n"
             "Modes:\n"
-            "  tilemap : parse_tilemap.py map.vram [palettes.plt] [map2.vram ...] tileset.png\n"
+            "  tilemap : parse_tilemap.py map.vram [palettes.plt] [map2.vram ...] "
+            "tileset.png\n"
             "  clean   : parse_tilemap.py map.tmx"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1491,19 +1340,13 @@ def _run_tilemap_pipeline(
         save_xml(array_2d, stem_path.with_suffix(".xml"))
     if args.csv:
         save_csv(array_2d, stem_path)
-    tiles, palette, color_count = load_tiles(png_path)
+    tiles, color_count = load_tiles(png_path)
     if args.deduplicate:
         tiles = deduplicate_tiles(tiles, array_2d)
     if args.remove_unused:
         tiles = remove_unused_tiles(tiles, array_2d)
-    rgb_palettes: list[list[tuple[int, int, int]]] | None = None
     if args.palettes is not None:
         rgb_palettes = parse_palettes_file(Path(args.palettes))
-    if rgb_palettes is not None and palette is not None:
-        # Use real RGB data from the .plt file to colorize tiles directly.
-        # apply_direct_palettes handles both 2bpp (4-color) and 4bpp (16-color)
-        # tilesets: pixel indices into the P-mode tile map straight to the
-        # first N colors of whichever rgb_palettes[pal_id] sub-palette applies.
         tiles = apply_direct_palettes(
             tiles,
             array_2d,
@@ -1511,25 +1354,15 @@ def _run_tilemap_pipeline(
             stride=color_count if color_count == 4 else None,
         )
     else:
-        if palette is not None and color_count == 4:
-            tiles, palette, color_count = apply_palette_offsets(
-                tiles,
-                array_2d,
-                palette,
-                stride=color_count,
-            )
-        # Convert any remaining indexed tiles to RGBA.
         tiles = [t.convert("RGBA") if t.mode == "P" else t for t in tiles]
-    palette = None
     validate_indices(array_2d, len(tiles))
     save_tileset(
         tiles,
         stem_path.with_name(stem_path.stem + "_tileset.png"),
-        palette,
         quantize=args.colorindexed,
     )
     if args.render:
-        render_image(array_2d, tiles, stem_path.with_suffix(".png"), palette)
+        render_image(array_2d, tiles, stem_path.with_suffix(".png"))
     save_tiled(array_2d, len(tiles), stem_path)
 
 
