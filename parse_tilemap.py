@@ -499,41 +499,34 @@ def parse_palettes_file(
     return palettes
 
 
-def apply_direct_palettes(
+def _canonical_tile_bytes(img: Image.Image) -> bytes:
+    """Return RGBA bytes with transparent pixels normalised to ``(0,0,0,0)``.
+
+    Two tiles whose only difference is the RGB value of fully-transparent
+    pixels compare equal after this normalisation.
+    """
+    raw = bytearray(img.tobytes())
+    for i in range(0, len(raw), 4):
+        if raw[i + 3] == 0:
+            raw[i] = raw[i + 1] = raw[i + 2] = 0
+    return bytes(raw)
+
+
+def _colorize_variants(
     tiles: list[Image.Image],
-    array_2d: list[list[TileEntry]],
+    sorted_pairs: list[tuple[int, int]],
     rgb_palettes: list[list[tuple[int, int, int]]],
-    stride: int | None = None,
+    stride: int | None,
 ) -> list[Image.Image]:
-    """Create per-(tile, palette) RGBA variants using real RGB color data.
+    """Return one RGBA image per ``(tile_index, raw_palette)`` pair.
 
-    For each unique ``(tile_index, palette_id)`` pair referenced in *array_2d*,
-    a copy of the tile is colorized with ``rgb_palettes[palette_id]`` and
-    converted to RGBA.  *array_2d* is updated in-place.  Returns the expanded
-    RGBA tile list.
-
-    This is the correct path for 4bpp tilesets (16 colors per tile) where
-    each palette block in the file supplies a complete 16-color sub-palette.
-    ``palette_id`` is computed as ``e.palette % len(rgb_palettes)`` so both
-    0-based and SNES-style (8-offset) raw palette indices are handled safely.
+    For 2bpp (*stride* given) the raw palette decomposes into a main-palette
+    index ``PI = raw_pal // stride - 2`` and a color-group slice
+    ``CG = raw_pal % stride``.  For 4bpp (*stride* is ``None``) the raw
+    palette indexes *rgb_palettes* directly.
     """
     num_pal = len(rgb_palettes)
-    # used_pairs keyed on raw e.palette so tiles with the same CG but different
-    # main palette (PI) are treated as distinct.
-    used_pairs: set[tuple[int, int]] = {
-        (e.index, e.palette) for row in array_2d for e in row
-    }
-    sorted_pairs = sorted(used_pairs)
-    variant_map: dict[tuple[int, int], int] = {
-        pair: new_idx for new_idx, pair in enumerate(sorted_pairs)
-    }
-
-    # Step 1: colorize every used (tile, palette) pair into RGBA.
-    # For 2bpp (stride given): e.palette decomposes into
-    #   PI = e.palette // stride  → index of the 16-color main palette
-    #   CG = e.palette % stride   → which 4-color slice within that palette
-    # For 4bpp (stride=None): e.palette indexes rgb_palettes directly.
-    rgba_variants: list[Image.Image] = []
+    variants: list[Image.Image] = []
     for old_idx, raw_pal in sorted_pairs:
         t = tiles[old_idx].copy()
         if stride is not None:
@@ -549,42 +542,64 @@ def apply_direct_palettes(
             flat[i * 3 + 2] = b
         if t.mode == "P":
             t.putpalette(bytes(flat))
-        rgba_variants.append(t.convert("RGBA"))
+        variants.append(t.convert("RGBA"))
+    return variants
 
-    # Step 2: pixel-level deduplication — two (tile, palette) pairs that
-    # produce identical RGBA bytes are merged into one output tile.
-    # Fully-transparent pixels (alpha=0) are normalised to (0,0,0,0) before
-    # comparison so that two tiles whose only difference is the RGB value of
-    # transparent pixels are correctly treated as identical.
-    def _canonical_bytes(img: Image.Image) -> bytes:
-        raw = bytearray(img.tobytes())
-        for i in range(0, len(raw), 4):
-            if raw[i + 3] == 0:
-                raw[i] = raw[i + 1] = raw[i + 2] = 0
-        return bytes(raw)
 
+def _dedup_variants(
+    rgba_variants: list[Image.Image],
+) -> tuple[list[Image.Image], dict[int, int]]:
+    """Merge pixel-identical RGBA variants into a compact tile list.
+
+    Returns ``(unique_tiles, pixel_remap)`` where *pixel_remap* maps each
+    variant index to its canonical position in *unique_tiles*.
+    """
     bytes_to_canonical: dict[bytes, int] = {}
-    pixel_remap: dict[int, int] = {}  # variant index → final output index
-    new_tiles: list[Image.Image] = []
+    pixel_remap: dict[int, int] = {}
+    unique: list[Image.Image] = []
     for variant_idx, img in enumerate(rgba_variants):
-        raw = _canonical_bytes(img)
-        if raw in bytes_to_canonical:
-            pixel_remap[variant_idx] = bytes_to_canonical[raw]
+        key = _canonical_tile_bytes(img)
+        if key in bytes_to_canonical:
+            pixel_remap[variant_idx] = bytes_to_canonical[key]
         else:
-            canonical = len(new_tiles)
-            bytes_to_canonical[raw] = canonical
+            canonical = len(unique)
+            bytes_to_canonical[key] = canonical
             pixel_remap[variant_idx] = canonical
-            new_tiles.append(img)
+            unique.append(img)
+    return unique, pixel_remap
 
+
+def apply_direct_palettes(
+    tiles: list[Image.Image],
+    array_2d: list[list[TileEntry]],
+    rgb_palettes: list[list[tuple[int, int, int]]],
+    stride: int | None = None,
+) -> list[Image.Image]:
+    """Colorize tiles with real RGB data from a ``.plt`` file.
+
+    Builds one RGBA variant per unique ``(tile_index, raw_palette)`` pair
+    found in *array_2d*, then merges pixel-identical variants.  Updates
+    *array_2d* in-place and returns the deduplicated RGBA tile list.
+    """
+    num_pal = len(rgb_palettes)
+    used_pairs: set[tuple[int, int]] = {
+        (e.index, e.palette) for row in array_2d for e in row
+    }
+    sorted_pairs = sorted(used_pairs)
+    variant_map = {pair: idx for idx, pair in enumerate(sorted_pairs)}
+
+    rgba_variants = _colorize_variants(tiles, sorted_pairs, rgb_palettes, stride)
+    new_tiles, pixel_remap = _dedup_variants(rgba_variants)
     duplicates_removed = len(rgba_variants) - len(new_tiles)
 
     for row in array_2d:
         for e in row:
             e.index = pixel_remap[variant_map[(e.index, e.palette)]]
-            if stride is not None:
-                e.palette = e.palette // stride - 2
-            else:
-                e.palette = e.palette % num_pal
+            e.palette = (
+                (e.palette // stride - 2)
+                if stride is not None
+                else (e.palette % num_pal)
+            )
 
     log.info(
         "Direct palette colorization: %d variant(s) from %d tile(s) "
